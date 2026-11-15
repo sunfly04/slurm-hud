@@ -64,6 +64,8 @@ On first launch the HUD shows **CONFIG ERROR**: click **EDIT**, set `host`, save
 | `host` | (empty) | A `Host` alias from `~/.ssh/config` |
 | `label` | host name | Title shown in the header |
 | `refreshSeconds` | `60` | Polling interval, 10–3600 |
+| `slowRefreshSeconds` | `300` | Interval for fair-share, CLUSTER and history, which change slowly; 10–3600. They are also re-read soon after one of your jobs leaves the queue, and on a manual refresh |
+| `pauseWhenLocked` | `true` | Stop polling while the screen is locked, the displays sleep or another user is logged in; refresh right after |
 | `maxRows` | `8` | Rows shown per RUNNING / QUEUE section, 1–50 |
 | `historyHours` | `12` | Window for the history line, 1–336 |
 | `showCluster`, `showHistory` | `true` | Turning one off also skips its query on the cluster |

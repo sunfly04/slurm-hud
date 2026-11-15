@@ -77,6 +77,11 @@ RSS overstates it because it counts shared frameworks.
   History is counted server-side with awk; only the top 3 failures are sent.
 - A query that fails (`@@NA`) keeps the previous round's data for that section, marked STALE. It is never shown as zeros.
 - Config reloads bump `Store.gen`. Results from an older generation are dropped, never applied to the new host.
+- Polling cost: SHARE, NODES and HIST run only every `slowRefreshSeconds` (`Store.nextSlow`); other rounds copy them
+  from the last snapshot (`keepSlow`), keeping their stale/unavailable marks. A job ID leaving the queue (array tasks by
+  base ID) pulls the next slow round forward, at most once a minute; a failed slow query retries after ≤ 60 s.
+  While the screen is locked, the displays sleep or the session is switched out, `Store.paused` stops polling
+  (`pauseWhenLocked`); resuming does one full refresh. `masterUp` skips the `ssh -O check` process when the socket file is absent.
 - Keep idle CPU ~0: no repeating SwiftUI animations or per-second timers. The UI redraws only when data changes,
   and `scheduleRelayout()` coalesces the size measurement to once per main-loop turn.
 - The repo lives in an iCloud-synced folder. codesign rejects bundles there ("resource fork, Finder information…"),

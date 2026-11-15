@@ -19,6 +19,8 @@ struct Config: Codable, Equatable {
     var host = ""      // a Host alias from ~/.ssh/config
     var label = ""     // header title; defaults to the host name
     var refreshSeconds = 60.0
+    var slowRefreshSeconds = 300.0     // fair-share (sshare), CLUSTER (sinfo) and history (sacct) change slowly
+    var pauseWhenLocked = true         // no polling while the screen is locked, the displays sleep or another user is active
     var maxRows = 8
     var historyHours = 12
     var showCluster = true
@@ -34,6 +36,8 @@ struct Config: Codable, Equatable {
         host = try c.decodeIfPresent(String.self, forKey: .host) ?? d.host
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? d.label
         refreshSeconds = try c.decodeIfPresent(Double.self, forKey: .refreshSeconds) ?? d.refreshSeconds
+        slowRefreshSeconds = try c.decodeIfPresent(Double.self, forKey: .slowRefreshSeconds) ?? d.slowRefreshSeconds
+        pauseWhenLocked = try c.decodeIfPresent(Bool.self, forKey: .pauseWhenLocked) ?? d.pauseWhenLocked
         maxRows = try c.decodeIfPresent(Int.self, forKey: .maxRows) ?? d.maxRows
         historyHours = try c.decodeIfPresent(Int.self, forKey: .historyHours) ?? d.historyHours
         showCluster = try c.decodeIfPresent(Bool.self, forKey: .showCluster) ?? d.showCluster
@@ -46,6 +50,7 @@ struct Config: Codable, Equatable {
     /// Keep numbers in sane ranges so no view or query can be fed nonsense.
     mutating func clamp() {
         refreshSeconds = refreshSeconds.isFinite ? min(max(refreshSeconds, 10), 3600) : 60
+        slowRefreshSeconds = slowRefreshSeconds.isFinite ? min(max(slowRefreshSeconds, 10), 3600) : 300
         maxRows = min(max(maxRows, 1), 50)
         historyHours = min(max(historyHours, 1), 24 * 14)
     }
@@ -327,7 +332,7 @@ enum Remote {
     // `sq` strips the column padding of -O output (~150 KB -> ~11 KB per round on a ~200-node cluster).
     // Names go in the last column so a '|' inside a name can be re-joined by the parser.
     static let script = #"""
-    H=__HOURS__; WANT_NODES=__NODES__; WANT_HIST=__HIST__
+    H=__HOURS__; WANT_SHARE=__SHARE__; WANT_NODES=__NODES__; WANT_HIST=__HIST__
     export SLURM_TIME_FORMAT=%s
     sq() { sed -E 's/ +\|/|/g'; }
     command -v squeue >/dev/null 2>&1 || { echo "@@ERR slurm commands not found in PATH"; exit 0; }
@@ -337,13 +342,15 @@ enum Remote {
     J=$(squeue -u "$USER" -h -O "JobArrayID:60|,Partition:120|,StateCompact:8|,TimeUsed:20|,TimeLimit:20|,NumNodes:8|,tres-alloc:300|,ReasonList:300|,StartTime:24|,tres-per-node:120|,Name:300|" 2>&1) || { echo "@@ERR $(printf '%s' "$J" | tail -n 1)"; exit 0; }
     echo "@@JOBS"
     [ -n "$J" ] && printf '%s\n' "$J" | sq
-    if U=$(sshare -nP -U -u "$USER" -o Account,User,FairShare,LevelFS 2>/dev/null); then
-      echo "@@SHARE"
-      [ -n "$U" ] && printf '%s\n' "$U"
-      A=$(printf '%s\n' "$U" | cut -d'|' -f1 | sed 's/^ *//' | grep -v '^$' | sort -u | paste -sd, -)
-      [ -n "$A" ] && sshare -nP -A "$A" -o Account,User,FairShare,LevelFS 2>/dev/null | awk -F'|' '$1 !~ /^ / && $2 == "" {print "ACCT|"$0}'
-    else
-      echo "@@NA SHARE"
+    if [ "$WANT_SHARE" = 1 ]; then
+      if U=$(sshare -nP -U -u "$USER" -o Account,User,FairShare,LevelFS 2>/dev/null); then
+        echo "@@SHARE"
+        [ -n "$U" ] && printf '%s\n' "$U"
+        A=$(printf '%s\n' "$U" | cut -d'|' -f1 | sed 's/^ *//' | grep -v '^$' | sort -u | paste -sd, -)
+        [ -n "$A" ] && sshare -nP -A "$A" -o Account,User,FairShare,LevelFS 2>/dev/null | awk -F'|' '$1 !~ /^ / && $2 == "" {print "ACCT|"$0}'
+      else
+        echo "@@NA SHARE"
+      fi
     fi
     if [ "$WANT_NODES" = 1 ]; then
       if N=$(sinfo -h -N -O "NodeHost:80|,Gres:300|,GresUsed:300|,StateCompact:20|" 2>/dev/null); then
@@ -371,11 +378,13 @@ enum Remote {
     echo "@@END"
     """#
 
-    static func render(_ c: Config) -> String {
+    /// `slow: false` leaves out the fair-share, node and history queries; the Store keeps showing their last result.
+    static func render(_ c: Config, slow: Bool = true) -> String {
         script
             .replacingOccurrences(of: "__HOURS__", with: String(c.historyHours))
-            .replacingOccurrences(of: "__NODES__", with: c.showCluster ? "1" : "0")
-            .replacingOccurrences(of: "__HIST__", with: c.showHistory ? "1" : "0")
+            .replacingOccurrences(of: "__SHARE__", with: slow ? "1" : "0")
+            .replacingOccurrences(of: "__NODES__", with: c.showCluster && slow ? "1" : "0")
+            .replacingOccurrences(of: "__HIST__", with: c.showHistory && slow ? "1" : "0")
     }
 }
 
@@ -723,7 +732,9 @@ enum SSH {
     }
 
     static func masterUp(_ c: Config, _ cp: String?) -> Bool {
-        guard cp != nil else { return false }
+        guard let cp else { return false }
+        // No socket file means no master: skip spawning ssh. A file that exists still has to pass the real check.
+        if !FileManager.default.fileExists(atPath: (cp as NSString).expandingTildeInPath) { return false }
         return run(["-o", "LogLevel=QUIET"] + base(c, cp) + ["-O", "check", "--", c.host], stdin: nil, timeout: 5).status == 0
     }
 
@@ -788,6 +799,11 @@ final class Store: ObservableObject {
     private var cfgError: String?
     let prefs: Prefs
     private var stopped = false
+    private var idle = false                 // screen locked / displays asleep / user switched out
+    private var nextSlow = Date.distantPast  // when the slow queries are due again
+    private var lastSlow = Date.distantPast  // when they last ran
+    static let slowSections: Set<String> = ["SHARE", "NODES", "HIST"]
+    var paused: Bool { idle && cfg.pauseWhenLocked && demoText == nil }
 
     private var timer: Timer?
     private var fastUntil = Date.distantPast
@@ -816,7 +832,19 @@ final class Store: ObservableObject {
         timer?.invalidate()
     }
 
+    /// The Mac is (not) being looked at. Polling stops while paused; coming back fetches everything at once.
+    func setIdle(_ v: Bool) {
+        let was = paused
+        idle = v
+        if paused { timer?.invalidate() }
+        else if was {
+            nextSlow = .distantPast
+            refreshSoon(1)
+        }
+    }
+
     func apply(_ c: Config, _ e: String?) {
+        nextSlow = .distantPast
         cfg = c
         cfgError = e
         gen += 1
@@ -851,13 +879,16 @@ final class Store: ObservableObject {
         link = .live
     }
 
-    func refresh() {
-        guard !syncing, !stopped else { return }
+    /// `full` also runs the slow queries now (manual refresh, retry).
+    func refresh(full: Bool = false) {
+        if full { nextSlow = .distantPast }
+        guard !syncing, !stopped, !paused else { return }
         timer?.invalidate()
         if let d = demoText { applyDemo(d); return }
         if let e = cfgError { link = .config(e); return }   // wait for Reload Config
         syncing = true
         let cfg = self.cfg, myGen = gen
+        let slow = Date() >= nextSlow || snap == nil
         // The old key for a plain host; options that may point ssh elsewhere get their own cache entry.
         let envKey = "remoteEnv." + (cfg.extraSSHOptions.isEmpty ? cfg.host : cfg.target)
         let cached = UserDefaults.standard.string(forKey: envKey)
@@ -881,7 +912,7 @@ final class Store: ObservableObject {
                     }
                 }
                 let res = SSH.run(SSH.fetchArgs(cfg, cp, masterOnly: master) + ["--", cfg.host, remote],
-                                  stdin: prelude + Remote.render(cfg), timeout: 30)
+                                  stdin: prelude + Remote.render(cfg, slow: slow), timeout: 30)
                 if res.status == 0 && !res.timedOut { parsed = Parser.parse(res.out) }
                 r = res
             }
@@ -902,12 +933,12 @@ final class Store: ObservableObject {
                     return
                 }
                 if !master && !masterOnlyMode && gate == .failed { self.directFailed = true }   // another window's login failed
-                self.finish(r, parsed, usedLogin: cached == nil, viaMaster: master, envKey: envKey)
+                self.finish(r, parsed, usedLogin: cached == nil, viaMaster: master, envKey: envKey, slow: slow)
             }
         }
     }
 
-    private func finish(_ r: SSH.Result?, _ p: Parser.Out?, usedLogin: Bool, viaMaster: Bool, envKey: String) {
+    private func finish(_ r: SSH.Result?, _ p: Parser.Out?, usedLogin: Bool, viaMaster: Bool, envKey: String, slow: Bool) {
         syncing = false
         guard let r else {   // no master socket and direct logins are off
             link = .auth
@@ -924,7 +955,24 @@ final class Store: ObservableObject {
         } else if let p, var sn = p.snap {
             if usedLogin, let env = p.env { UserDefaults.standard.set(env, forKey: envKey) }
             sn.fetched = Date()
-            if let old = snap { carryOver(from: old, into: &sn) }
+            let now = Date()
+            let soon = lastSlow.addingTimeInterval(min(60, cfg.slowRefreshSeconds))   // early runs: at most once a minute
+            if slow {
+                lastSlow = now
+                nextSlow = now.addingTimeInterval(cfg.slowRefreshSeconds)
+                // A slow query failed: try again soon, not every round.
+                if !sn.unavailable.isDisjoint(with: Store.slowSections) { nextSlow = now.addingTimeInterval(min(60, cfg.slowRefreshSeconds)) }
+            }
+            if let old = snap {
+                if !slow {
+                    keepSlow(from: old, into: &sn)
+                    // A job left the queue: the history and the free GPUs just changed. Array tasks count by their
+                    // job ID, so a pending array that starts a task (123_[0-9] -> 123_[1-9]) is not a departure.
+                    func base(_ id: String) -> Substring { id.prefix { $0 != "_" } }
+                    if !Set(old.jobs.map { base($0.id) }).subtracting(sn.jobs.map { base($0.id) }).isEmpty { nextSlow = min(nextSlow, soon) }
+                }
+                carryOver(from: old, into: &sn)
+            }
             link = .live
             backoff = 30
             addSample(sn.gpuRun)
@@ -959,6 +1007,18 @@ final class Store: ObservableObject {
         if r.timedOut { return true }
         if let p, p.err != nil || p.snap != nil { return false }
         return !SSH.isNetworkError(r.err)
+    }
+
+    /// A round without the slow queries shows their last result as it was (fresh, stale or unavailable).
+    private func keepSlow(from old: Snapshot, into sn: inout Snapshot) {
+        sn.shares = old.shares
+        sn.acctLFS = old.acctLFS
+        sn.pools = old.pools
+        sn.hist = old.hist
+        for k in Store.slowSections {
+            if old.stale.contains(k) { sn.stale.insert(k) }
+            if old.unavailable.contains(k) { sn.unavailable.insert(k) }
+        }
     }
 
     /// Keep showing the last good data for a section whose query failed this round, marked stale.
@@ -997,6 +1057,7 @@ final class Store: ObservableObject {
         case .error: iv = fast ? 4 : 60
         case .config: return
         }
+        guard !paused else { return }   // resumed by setIdle(false)
         schedule(iv)
     }
 
@@ -1008,9 +1069,19 @@ final class Store: ObservableObject {
         timer = t
     }
 
-    func wake() {
+    func wake() { refreshSoon(4) }   // give the network a moment after sleep
+
+    /// System wake and screen unlock often arrive together: keep one pending refresh, at the later deadline.
+    private var resume: DispatchWorkItem?
+    private var resumeAt = Date.distantPast
+    private func refreshSoon(_ delay: Double) {
+        let at = max(Date().addingTimeInterval(delay), resume == nil ? .distantPast : resumeAt)
+        resume?.cancel()
         timer?.invalidate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.refresh() }
+        let w = DispatchWorkItem { [weak self] in self?.resume = nil; self?.refresh() }
+        resume = w
+        resumeAt = at
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, at.timeIntervalSinceNow), execute: w)
     }
 
     /// Opens Terminal with a one-shot script that starts a persistent ssh master (you do MFA there once).
@@ -1149,7 +1220,7 @@ struct HUDView: View {
 struct RootMenu: View {
     @ObservedObject var s: Store
     var body: some View {
-        Button("Refresh Now") { s.refresh() }
+        Button("Refresh Now") { s.refresh(full: true) }
         Button(s.compact ? "Expand" : "Compact") { s.toggleCompact() }
         Divider()
         let hud = AppDelegate.shared?.hud(for: s)
@@ -1225,7 +1296,7 @@ struct Banner: View {
                 Button("EDIT") { AppDelegate.shared?.editConfig() }.buttonStyle(HUDButton(color: color))
                 Button("RELOAD") { AppDelegate.shared?.reloadConfig() }.buttonStyle(HUDButton(color: color))
             case .error:
-                Button("RETRY") { s.refresh() }.buttonStyle(HUDButton(color: color))
+                Button("RETRY") { s.refresh(full: true) }.buttonStyle(HUDButton(color: color))
             default:
                 Button("RECONNECT") { s.reconnect() }.buttonStyle(HUDButton(color: color))
             }
@@ -1891,7 +1962,7 @@ final class ServerHUD: NSObject {
 
     var menuTitle: String { "\(store.cfg.displayLabel) · \(store.cfg.host)  —  \(store.statusText)" }
 
-    @objc func refreshNow() { store.refresh() }
+    @objc func refreshNow() { store.refresh(full: true) }
     @objc func toggleCompact() { store.toggleCompact() }
     @objc func setFloat() { if layer != .float { toggleLayer() } }
     @objc func setDesktop() { if layer != .desktop { toggleLayer() } }
@@ -1916,6 +1987,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     var demoText: String?
     var renderPath: String?
+    private var locked = false, displaysAsleep = false, switchedOut = false
+    var idle: Bool { locked || displaysAsleep || switchedOut }
     private var renderSub: AnyCancellable?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -1933,9 +2006,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         buildStatusItem()
         sync(Config.loadAll(), start: false)
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.huds.forEach { $0.store.wake() }
         }
+        // Nobody can see the HUD: stop polling the cluster until somebody can.
+        let dn = DistributedNotificationCenter.default()
+        dn.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.setIdle { $0.locked = true } }
+        dn.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.setIdle { $0.locked = false } }
+        ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in self?.setIdle { $0.displaysAsleep = true } }
+        ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.setIdle { $0.displaysAsleep = false } }
+        ws.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.setIdle { $0.switchedOut = true } }
+        ws.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.setIdle { $0.switchedOut = false } }
         huds.forEach { $0.store.refresh() }
     }
 
@@ -1957,6 +2039,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let s = Store(c, e, prefs: Prefs(id: ids[i], legacy: i == 0))
             s.demoText = demoText
+            s.setIdle(idle)
             let h = ServerHUD(store: s, index: i)
             if i < huds.count { huds[i].close(); huds[i] = h } else { huds.append(h) }
             fresh.append(s)
@@ -1973,6 +2056,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func hud(for s: Store) -> ServerHUD? { huds.first { $0.store === s } }
+
+    private func setIdle(_ change: (AppDelegate) -> Void) {
+        change(self)
+        huds.forEach { $0.store.setIdle(idle) }
+    }
 
     @MainActor func renderPNG(_ path: String) {
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -2051,7 +2139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return it
     }
 
-    @objc func refreshAll() { huds.forEach { $0.store.refresh() } }
+    @objc func refreshAll() { huds.forEach { $0.store.refresh(full: true) } }
     @objc func toggleAll() {
         let show = !huds.contains { $0.panel.isVisible }
         for h in huds where h.panel.isVisible != show { h.toggleHUD() }

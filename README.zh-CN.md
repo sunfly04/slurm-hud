@@ -60,6 +60,8 @@ cd slurm-hud
 | `host` | （空） | `~/.ssh/config` 里的 `Host` 别名 |
 | `label` | host 名 | 标题栏显示的名字 |
 | `refreshSeconds` | `60` | 刷新间隔，10–3600 秒 |
+| `slowRefreshSeconds` | `300` | fair-share、CLUSTER 和历史这几项变化慢，单独按这个间隔查询，10–3600 秒。你有作业离开队列后会很快补查一次，手动刷新时也会一起查 |
+| `pauseWhenLocked` | `true` | 锁屏、显示器休眠或切换到其他用户时停止轮询，回来后立刻刷新 |
 | `maxRows` | `8` | RUNNING / QUEUE 每节最多显示几行，1–50 |
 | `historyHours` | `12` | 历史统计的时间窗口，1–336 小时 |
 | `showCluster`、`showHistory` | `true` | 关掉后，集群上对应的查询也不再执行 |
