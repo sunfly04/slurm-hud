@@ -1,0 +1,23 @@
+host: login1|alice
+job 8000001 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=eval_s0
+job 8000002 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=eval_s1
+job 8000003 st=R tasks=1 gpus=2 types=[h100:2] start=1794699000 name=eval_s10
+job 8000004 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=ablate_a
+job 8000005 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=ablate_b
+job 8000006 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=ablate
+job 8000007 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=ft_lr1e-4_run
+job 8000008 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=ft_lr3e-5_run
+job 8000009_3 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=sweep
+job 8000009_4 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=sweep
+job 8000009_[5-9] st=PD tasks=5 gpus=5 types=[l40s:1] start=1794790000 name=sweep
+job 8000010 st=PD tasks=1 gpus=1 types=[l40s:1] start=1794780000 name=sweep
+job 8000011 st=PD tasks=1 gpus=1 types=[l40s:1] start=- name=solo_job
+share lab-ml fs=0.500 lfs=1.000
+hist ok=0 fail=0 timeout=0 cancel=0
+group eval_s* n=3 gpus=4 ids=8000001,8000002,8000003
+group ablate_* n=2 gpus=2 ids=8000004,8000005
+group ft_lr*_run n=2 gpus=2 ids=8000007,8000008
+group sweep n=2 gpus=2 ids=8000009_3,8000009_4
+group sweep n=2 gpus=6 ids=8000010,8000009_[5-9]
+unavailable: 
+totals gpuRun=11 gpuPend=7 pendingTasks=7

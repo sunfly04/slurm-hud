@@ -13,6 +13,10 @@ fair-share (LevelFS) and cluster GPU availability. User-facing docs: README.md (
   - `Remote.script`: bash sent over ssh stdin. It prints `@@TAG` sections (HOST, NOW, ENV, JOBS, SHARE, NODES, HIST, END)
     and `@@NA <SECTION>` when a query fails, so a failure never looks like an empty result. A fatal problem prints `@@ERR`.
   - `Parser`: turns that text into `Snapshot`. `Parser.describe` gives a deterministic dump for tests.
+  - `Grouper`: folds jobs into `JobGroup` rows. Config `groupRules` (regex on the name) win; otherwise names that are equal
+    after masking numbers and a trailing one-letter token share a row. `Parser.describe` prints multi-job groups (`Tests/grouping.txt`).
+  - `T` (theme): Morandi palette. Every colour is `T.dyn(dark, light)` and follows the system appearance; don't add fixed
+    `Color(red:…)` or `.white`/`.black` in views. `--light` / `--dark` force one for `--render`.
   - `SSH`: `Process` wrapper for `/usr/bin/ssh` and the ControlMaster helpers.
   - `Store`: the poller (`ObservableObject`). It owns link state, backoff, the config generation and the reconnect flow.
   - Views (`HUDView` and below): SwiftUI. `Canvas` draws the grid, meters, sparkline and GPU blocks.

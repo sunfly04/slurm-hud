@@ -63,6 +63,12 @@ On first launch the HUD shows **CONFIG ERROR**: click **EDIT**, set `host`, save
 | `historyHours` | `12` | Window for the history line, 1–336 |
 | `showCluster`, `showHistory` | `true` | Turning one off also skips its query on the cluster |
 | `extraSSHOptions` | `[]` | Extra ssh arguments for every call, e.g. `["-o", "Port=2222"]` |
+| `groupJobs` | `true` | Fold jobs whose names differ only by a number or a trailing one-letter token into one row (`eval_s0`, `eval_s1` → `eval_s* ×2`) |
+| `groupRules` | `[]` | Your own groups, checked before the automatic rule: `[{"match": "^llama", "label": "LLM finetunes"}]`. `match` is a regular expression on the job name; `label` is optional |
+
+A grouped row shows the job count, the GPUs of the whole group, one thin progress bar per job, and the time of the
+job closest to its limit. Hover for the per-job list; right-click to copy all job IDs. The HUD follows the system
+light / dark appearance.
 
 After editing, choose **Reload Config** from the menu bar item.
 

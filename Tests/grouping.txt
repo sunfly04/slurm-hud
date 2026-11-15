@@ -1,0 +1,20 @@
+@@HOST login1|alice
+@@NOW 1794700000
+@@ENV /etc/slurm/slurm.conf|/opt/slurm/bin
+@@JOBS
+8000001|gpu|R|10:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn001|1794699000|gres/gpu:l40s:1|eval_s0|
+8000002|gpu|R|20:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn002|1794699000|gres/gpu:l40s:1|eval_s1|
+8000003|gpu|R|30:00|1:00:00|1|cpu=8,gres/gpu=2,gres/gpu:h100=2|kn003|1794699000|gres/gpu:h100:2|eval_s10|
+8000004|gpu|R|5:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn004|1794699000|gres/gpu:l40s:1|ablate_a|
+8000005|gpu|R|5:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn005|1794699000|gres/gpu:l40s:1|ablate_b|
+8000006|gpu|R|5:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn006|1794699000|gres/gpu:l40s:1|ablate|
+8000007|gpu|R|5:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn007|1794699000|gres/gpu:l40s:1|ft_lr1e-4_run|
+8000008|gpu|R|5:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn008|1794699000|gres/gpu:l40s:1|ft_lr3e-5_run|
+8000009_3|gpu|R|5:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn009|1794699000|gres/gpu:l40s:1|sweep|
+8000009_4|gpu|R|5:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|kn010|1794699000|gres/gpu:l40s:1|sweep|
+8000009_[5-9]|gpu|PD|0:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|(Priority)|1794790000|gres/gpu:l40s:1|sweep|
+8000010|gpu|PD|0:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|(Resources)|1794780000|gres/gpu:l40s:1|sweep|
+8000011|gpu|PD|0:00|1:00:00|1|cpu=8,gres/gpu=1,gres/gpu:l40s=1|(Priority)|0|gres/gpu:l40s:1|solo_job|
+@@SHARE
+lab-ml|alice|0.5|1.0
+@@END

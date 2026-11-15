@@ -10,6 +10,11 @@ import ServiceManagement
 
 // MARK: - Config
 
+struct GroupRule: Codable, Equatable {
+    var match: String?   // regular expression, searched anywhere in the job name
+    var label: String?   // row title; defaults to the names' common prefix + "*"
+}
+
 struct Config: Codable, Equatable {
     var host = ""      // a Host alias from ~/.ssh/config
     var label = ""     // header title; defaults to the host name
@@ -19,6 +24,8 @@ struct Config: Codable, Equatable {
     var showCluster = true
     var showHistory = true
     var extraSSHOptions: [String] = []
+    var groupJobs = true               // fold jobs whose names differ only by a number / trailing letter into one row
+    var groupRules: [GroupRule] = []   // explicit groups, checked first: [{"match": "<regex on the job name>", "label": "..."}]
 
     init() {}
     init(from decoder: Decoder) throws {
@@ -32,6 +39,8 @@ struct Config: Codable, Equatable {
         showCluster = try c.decodeIfPresent(Bool.self, forKey: .showCluster) ?? d.showCluster
         showHistory = try c.decodeIfPresent(Bool.self, forKey: .showHistory) ?? d.showHistory
         extraSSHOptions = try c.decodeIfPresent([String].self, forKey: .extraSSHOptions) ?? d.extraSSHOptions
+        groupJobs = try c.decodeIfPresent(Bool.self, forKey: .groupJobs) ?? d.groupJobs
+        groupRules = try c.decodeIfPresent([GroupRule].self, forKey: .groupRules) ?? d.groupRules
     }
 
     /// Keep numbers in sane ranges so no view or query can be fed nonsense.
@@ -136,6 +145,83 @@ struct Snapshot: Equatable {
         var d: [String: Int] = [:]
         for j in js { for (t, n) in j.gpuByType where n > 0 { d[t, default: 0] += n * j.tasks } }
         return d.map { TypeCount(id: $0.key, n: $0.value) }.sorted { $0.n != $1.n ? $0.n > $1.n : $0.id < $1.id }
+    }
+}
+
+// MARK: - Grouping
+
+/// One HUD row: a single job, or several jobs that a rule put together.
+struct JobGroup: Identifiable, Equatable {
+    let id: String
+    let label: String
+    let jobs: [Job]
+
+    var tasks: Int { jobs.reduce(0) { $0 + $1.tasks } }
+    var gpus: Int { jobs.reduce(0) { $0 + $1.gpus } }
+    var gpuTotals: [String: Int] {
+        var d: [String: Int] = [:]
+        for j in jobs { for (t, n) in j.gpuByType where n > 0 { d[t, default: 0] += n * j.tasks } }
+        return d
+    }
+}
+
+enum Grouper {
+    private static let digits = try! NSRegularExpression(pattern: "[0-9]+")
+    private static var cache: [String: NSRegularExpression?] = [:]   // main thread only
+
+    /// Automatic rule: names that are equal once every number is masked and a trailing one-letter
+    /// token is dropped belong together (`eval_s0`/`eval_s1`, `ablate_a`/`ablate_b`, `lr1e-4`/`lr3e-5`).
+    static func stem(_ name: String) -> String {
+        var s = digits.stringByReplacingMatches(in: name, range: NSRange(name.startIndex..., in: name), withTemplate: "#")
+        let c = Array(s)
+        if c.count >= 3, c[c.count - 1].isLetter, "_-.".contains(c[c.count - 2]) { s = String(c.dropLast()) + "*" }
+        return s
+    }
+
+    /// Common prefix + "*" + common suffix, never cutting through the middle of a number.
+    static func label(_ names: [String]) -> String {
+        var seen = Set<String>()
+        let u = names.filter { seen.insert($0).inserted }.map(Array.init)
+        guard u.count > 1, let a = u.first else { return names.first ?? "" }
+        let minLen = u.map(\.count).min() ?? 0
+        var p = 0
+        while p < minLen, u.allSatisfy({ $0[p] == a[p] }) { p += 1 }
+        while p > 0, a[p - 1].isNumber { p -= 1 }
+        var q = 0
+        while q < minLen - p, u.allSatisfy({ $0[$0.count - 1 - q] == a[a.count - 1 - q] }) { q += 1 }
+        while q > 0, a[a.count - q].isNumber { q -= 1 }
+        return String(a[..<p]) + "*" + String(a[(a.count - q)...])
+    }
+
+    private static func regex(_ pattern: String) -> NSRegularExpression? {
+        if let hit = cache[pattern] { return hit }
+        let r = try? NSRegularExpression(pattern: pattern)   // a bad pattern is skipped, not fatal
+        cache[pattern] = r
+        return r
+    }
+
+    /// Keeps the order of first appearance. Config rules win over the automatic stem; first matching rule wins.
+    static func group(_ jobs: [Job], rules: [GroupRule] = [], enabled: Bool = true) -> [JobGroup] {
+        guard enabled else { return jobs.map { JobGroup(id: $0.id, label: $0.name, jobs: [$0]) } }
+        var order: [String] = []
+        var buckets: [String: [Job]] = [:]
+        var fixed: [String: String] = [:]
+        for j in jobs {
+            var key = "auto:" + stem(j.name)
+            for (i, r) in rules.enumerated() {
+                guard let m = r.match, !m.isEmpty, let re = regex(m),
+                      re.firstMatch(in: j.name, range: NSRange(j.name.startIndex..., in: j.name)) != nil else { continue }
+                key = "rule:\(i)"
+                if let l = r.label, !l.isEmpty { fixed[key] = l }
+                break
+            }
+            if buckets[key] == nil { order.append(key) }
+            buckets[key, default: []].append(j)
+        }
+        return order.map { k in
+            let js = buckets[k] ?? []
+            return JobGroup(id: k, label: fixed[k] ?? label(js.map(\.name)), jobs: js)
+        }
     }
 }
 
@@ -457,6 +543,9 @@ enum Parser {
         for p in s.pools { r.append("pool \(p.id) total=\(p.total) used=\(p.used) free=\(p.free)") }
         r.append("hist ok=\(s.hist.ok) fail=\(s.hist.fail) timeout=\(s.hist.timeout) cancel=\(s.hist.cancel)")
         for f in s.hist.failures { r.append("failure \(f.id) \(f.state) \(f.name)") }
+        for g in Grouper.group(s.running) + Grouper.group(s.pending) where g.jobs.count > 1 {
+            r.append("group \(g.label) n=\(g.jobs.count) gpus=\(g.gpus) ids=\(g.jobs.map(\.id).joined(separator: ","))")
+        }
         r.append("unavailable: \(s.unavailable.sorted().joined(separator: ","))")
         r.append("totals gpuRun=\(s.gpuRun) gpuPend=\(s.gpuPend) pendingTasks=\(s.pendingTasks)")
         return r.joined(separator: "\n")
@@ -804,17 +893,33 @@ final class Store: ObservableObject {
 // MARK: - Theme
 
 enum T {
-    static let cyan = Color(red: 0.24, green: 0.95, blue: 1.0)
-    static let chrome = Color(red: 0.38, green: 0.76, blue: 0.95)
-    static let green = Color(red: 0.32, green: 1.0, blue: 0.64)
-    static let amber = Color(red: 1.0, green: 0.72, blue: 0.30)
-    static let red = Color(red: 1.0, green: 0.33, blue: 0.45)
-    static let magenta = Color(red: 1.0, green: 0.36, blue: 0.86)
-    static let violet = Color(red: 0.70, green: 0.56, blue: 1.0)
-    static let lime = Color(red: 0.78, green: 1.0, blue: 0.36)
-    static let text = Color.white.opacity(0.92)
-    static let dim = Color.white.opacity(0.50)
-    static let faint = Color.white.opacity(0.24)
+    // Morandi palette: every hue is greyed down so nothing glows; state is carried by hue, not brightness.
+    // Each colour has a dark-mode and a light-mode value and follows the system appearance on its own.
+    typealias RGB = (Double, Double, Double)
+    static func dyn(_ dark: RGB, _ light: RGB, _ alpha: Double = 1) -> Color {
+        Color(nsColor: NSColor(name: nil) { ap in
+            let c = ap.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: c.0, green: c.1, blue: c.2, alpha: alpha)
+        })
+    }
+    static let cyan = dyn((0.60, 0.72, 0.78), (0.33, 0.47, 0.55))      // dusty blue
+    static let chrome = dyn((0.63, 0.66, 0.69), (0.42, 0.45, 0.49))    // blue-grey
+    static let green = dyn((0.64, 0.74, 0.62), (0.35, 0.49, 0.36))     // sage
+    static let amber = dyn((0.84, 0.72, 0.55), (0.66, 0.47, 0.24))     // sand / ochre
+    static let red = dyn((0.80, 0.55, 0.54), (0.68, 0.34, 0.34))       // dusty rose
+    static let magenta = dyn((0.76, 0.60, 0.68), (0.59, 0.36, 0.48))   // mauve
+    static let violet = dyn((0.66, 0.63, 0.78), (0.44, 0.40, 0.61))    // lavender grey
+    static let lime = dyn((0.72, 0.73, 0.56), (0.47, 0.49, 0.26))      // olive
+    private static let ink: RGB = (0.93, 0.91, 0.88)                   // warm off-white
+    private static let inkLight: RGB = (0.20, 0.19, 0.18)              // warm charcoal
+    static let text = dyn(ink, inkLight, 0.92)
+    static let dim = dyn(ink, inkLight, 0.55)
+    static let faint = dyn(ink, inkLight, 0.30)
+    static let track = dyn(ink, inkLight, 0.09)                        // empty part of a meter
+    static let tick = dyn((0.10, 0.10, 0.11), (0.94, 0.92, 0.89), 0.7) // meter tick marks: the panel colour
+    static let border = dyn((1, 1, 1), (0, 0, 0), 0.10)
+    static let bgTop = dyn((0.145, 0.140, 0.145), (0.955, 0.940, 0.915), 0.86)
+    static let bgBottom = dyn((0.105, 0.100, 0.108), (0.925, 0.905, 0.880), 0.92)
 
     static func mono(_ size: CGFloat, _ w: Font.Weight = .regular) -> Font { .system(size: size, weight: w, design: .monospaced) }
 
@@ -875,52 +980,9 @@ struct RootMenu: View {
 struct Chrome: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
-        ZStack {
-            LinearGradient(colors: [Color(red: 0.03, green: 0.08, blue: 0.12).opacity(0.80),
-                                    Color(red: 0.00, green: 0.02, blue: 0.05).opacity(0.88)],
-                           startPoint: .top, endPoint: .bottom)
-            Canvas { ctx, size in
-                var grid = Path()
-                for x in stride(from: CGFloat(0), through: size.width, by: 24) {
-                    grid.move(to: CGPoint(x: x, y: 0)); grid.addLine(to: CGPoint(x: x, y: size.height))
-                }
-                for y in stride(from: CGFloat(0), through: size.height, by: 24) {
-                    grid.move(to: CGPoint(x: 0, y: y)); grid.addLine(to: CGPoint(x: size.width, y: y))
-                }
-                ctx.stroke(grid, with: .color(T.cyan.opacity(0.045)), lineWidth: 0.5)
-                var scan = Path()
-                for y in stride(from: CGFloat(0), through: size.height, by: 3) {
-                    scan.move(to: CGPoint(x: 0, y: y)); scan.addLine(to: CGPoint(x: size.width, y: y))
-                }
-                ctx.stroke(scan, with: .color(.black.opacity(0.16)), lineWidth: 1)
-            }
-        }
-        .clipShape(shape)
-        .overlay(shape.strokeBorder(T.chrome.opacity(0.26), lineWidth: 1))
-        .overlay(CornerGlints(radius: 12).stroke(T.cyan.opacity(0.95), style: StrokeStyle(lineWidth: 1.6, lineCap: .round)))
-    }
-}
-
-/// Bright arcs + short tails on the four corners of the rounded border.
-struct CornerGlints: Shape {
-    let radius: CGFloat
-    func path(in rect: CGRect) -> Path {
-        let r = rect.insetBy(dx: 0.8, dy: 0.8)
-        let k = radius - 0.8, tail: CGFloat = 12
-        var p = Path()
-        p.move(to: CGPoint(x: r.minX, y: r.minY + k + tail))
-        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.minY), tangent2End: CGPoint(x: r.minX + k, y: r.minY), radius: k)
-        p.addLine(to: CGPoint(x: r.minX + k + tail, y: r.minY))
-        p.move(to: CGPoint(x: r.maxX - k - tail, y: r.minY))
-        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.minY), tangent2End: CGPoint(x: r.maxX, y: r.minY + k), radius: k)
-        p.addLine(to: CGPoint(x: r.maxX, y: r.minY + k + tail))
-        p.move(to: CGPoint(x: r.maxX, y: r.maxY - k - tail))
-        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.maxY), tangent2End: CGPoint(x: r.maxX - k, y: r.maxY), radius: k)
-        p.addLine(to: CGPoint(x: r.maxX - k - tail, y: r.maxY))
-        p.move(to: CGPoint(x: r.minX + k + tail, y: r.maxY))
-        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.maxY), tangent2End: CGPoint(x: r.minX, y: r.maxY - k), radius: k)
-        p.addLine(to: CGPoint(x: r.minX, y: r.maxY - k - tail))
-        return p
+        LinearGradient(colors: [T.bgTop, T.bgBottom], startPoint: .top, endPoint: .bottom)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(T.border, lineWidth: 0.75))
     }
 }
 
@@ -939,11 +1001,11 @@ struct HeaderView: View {
             }
         }()
         HStack(spacing: 6) {
-            Text("◢").font(T.mono(9)).foregroundColor(T.cyan).shadow(color: T.cyan, radius: 3)
+            Text("◢").font(T.mono(9)).foregroundColor(T.cyan)
             Text(s.cfg.displayLabel.uppercased()).font(T.mono(11.5, .bold)).tracking(2.6).foregroundColor(T.text)
             Text("// \(s.snap?.node ?? s.cfg.host)").font(T.mono(9.5)).foregroundColor(T.dim).lineLimit(1)
             Spacer(minLength: 4)
-            Circle().fill(lc).frame(width: 5, height: 5).shadow(color: lc, radius: 3)
+            Circle().fill(lc).frame(width: 5, height: 5)
             Text(lt).font(T.mono(9, .bold)).tracking(1.4).foregroundColor(lc)
             if let t = s.snap?.fetched {
                 Text(Fmt.clock(t)).font(T.mono(9)).foregroundColor(T.dim)
@@ -1035,7 +1097,7 @@ struct Meter: View {
     var ticks = true
     var body: some View {
         Canvas { ctx, sz in
-            ctx.fill(Path(CGRect(origin: .zero, size: sz)), with: .color(.white.opacity(0.07)))
+            ctx.fill(Path(CGRect(origin: .zero, size: sz)), with: .color(T.track))
             let w = sz.width * CGFloat(max(0, min(1, frac.isFinite ? frac : 0)))
             if w > 0 {
                 ctx.fill(Path(CGRect(x: 0, y: 0, width: w, height: sz.height)),
@@ -1045,7 +1107,7 @@ struct Meter: View {
             if ticks {
                 for i in 1..<10 {
                     ctx.fill(Path(CGRect(x: sz.width * CGFloat(i) / 10, y: 0, width: 0.75, height: sz.height)),
-                             with: .color(.black.opacity(0.6)))
+                             with: .color(T.tick))
                 }
             }
         }
@@ -1097,7 +1159,6 @@ struct GPUBlocks: View {
                     if filled {
                         let first = i
                         ctx.drawLayer { l in
-                            l.addFilter(.shadow(color: c.opacity(0.75), radius: 2.5))
                             for k in 0..<n { l.fill(Path(roundedRect: cell(first + k), cornerRadius: min(1.5, w / 3)), with: .color(c)) }
                         }
                     } else {
@@ -1138,7 +1199,7 @@ struct BigStat: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(label).font(T.mono(8, .medium)).tracking(1.6).foregroundColor(T.dim)
-            Text("\(value)").font(T.mono(30, .light)).foregroundColor(color).shadow(color: color.opacity(0.65), radius: 6)
+            Text("\(value)").font(T.mono(30, .light)).foregroundColor(color)
         }
     }
 }
@@ -1150,61 +1211,80 @@ struct KV: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(k).font(T.mono(7.5, .medium)).tracking(1.3).foregroundColor(T.dim)
-            Text(v).font(T.mono(15, .medium)).foregroundColor(c).shadow(color: c.opacity(0.5), radius: 4)
+            Text(v).font(T.mono(15, .medium)).foregroundColor(c)
         }
     }
 }
 
 struct Chip: View {
-    let j: Job
+    let types: [String: Int]   // GPU type -> total count
     var body: some View {
-        let types = j.gpuByType.filter { $0.value > 0 }
-        let cpu = j.gpus == 0
+        let total = types.values.reduce(0, +)
+        let cpu = total == 0
         let single = types.count == 1 ? types.keys.first : nil
         let c = cpu ? T.dim : (single.map(T.gpu) ?? T.chrome)
-        let label = cpu ? "CPU" : "\((single ?? "mix").uppercased())×\(j.gpus)"
+        let label = cpu ? "CPU" : "\((single ?? "mix").uppercased())×\(total)"
         Text(label).font(T.mono(8.5, .bold)).foregroundColor(c)
             .padding(.horizontal, 4).padding(.vertical, 1)
             .background(RoundedRectangle(cornerRadius: 2.5).fill(c.opacity(0.12)))
             .overlay(RoundedRectangle(cornerRadius: 2.5).stroke(c.opacity(0.5), lineWidth: 0.5))
             .fixedSize()
-            .help(types.sorted { $0.key < $1.key }.map { "\($0.key.uppercased())×\($0.value * j.tasks)" }.joined(separator: " + "))
+            .help(types.sorted { $0.key < $1.key }.map { "\($0.key.uppercased())×\($0.value)" }.joined(separator: " + "))
     }
 }
 
 struct JobMenu: View {
-    let j: Job
+    let g: JobGroup
     var body: some View {
-        Text("\(j.id) · \(j.partition)")
-        Text(j.place)
-        Divider()
-        Button("Copy Job ID") { copy(j.id) }
-        Button("Copy Job Name") { copy(j.name) }
-        Button("Copy  scancel \(j.id)") { copy("scancel \(j.id)") }
+        let ids = g.jobs.map(\.id).joined(separator: " ")
+        if g.jobs.count == 1, let j = g.jobs.first {
+            Text("\(j.id) · \(j.partition)")
+            Text(j.place)
+            Divider()
+            Button("Copy Job ID") { copy(j.id) }
+            Button("Copy Job Name") { copy(j.name) }
+        } else {
+            Text("\(g.jobs.count) jobs · \(g.label)")
+            Divider()
+            Button("Copy \(g.jobs.count) Job IDs") { copy(ids) }
+            Button("Copy Job Names") { copy(g.jobs.map(\.name).joined(separator: "\n")) }
+        }
+        Button("Copy  scancel \(g.jobs.count == 1 ? ids : "… (\(g.jobs.count) jobs)")") { copy("scancel \(ids)") }
     }
     func copy(_ s: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string) }
+}
+
+extension JobGroup {
+    /// Tooltip: one line per job.
+    var detail: String {
+        jobs.prefix(20).map { j in
+            let t = j.isPending ? "" : " · \(Fmt.hm(j.elapsed))/\(Fmt.hm(j.limit))"
+            return jobs.count == 1 ? "\(j.id) · \(j.partition) · \(j.place)" : "\(j.id) · \(j.name) · \(j.place)\(t)"
+        }.joined(separator: "\n") + (jobs.count > 20 ? "\n+ \(jobs.count - 20) more" : "")
+    }
 }
 
 struct FullView: View {
     let snap: Snapshot
     @ObservedObject var s: Store
     var body: some View {
-        let running = snap.running, pending = snap.pending
+        let running = Grouper.group(snap.running, rules: s.cfg.groupRules, enabled: s.cfg.groupJobs)
+        let pending = Grouper.group(snap.pending, rules: s.cfg.groupRules, enabled: s.cfg.groupJobs)
         let rows = s.cfg.maxRows
         VStack(alignment: .leading, spacing: 11) {
             GPUSection(snap: snap, spark: s.spark.map(\.v), sparkMinutes: s.sparkMinutes)
             FairShareSection(snap: snap)
             if !running.isEmpty {
                 VStack(alignment: .leading, spacing: 5) {
-                    SectionHead(title: "RUNNING", tail: "\(running.count)", color: T.green)
-                    ForEach(running.prefix(rows)) { RunRow(j: $0) }
+                    SectionHead(title: "RUNNING", tail: "\(snap.running.count)", color: T.green)
+                    ForEach(running.prefix(rows)) { RunRow(g: $0) }
                     if running.count > rows { More(n: running.count - rows) }
                 }
             }
             if !pending.isEmpty {
                 VStack(alignment: .leading, spacing: 5) {
                     SectionHead(title: "QUEUE", tail: "\(snap.pendingTasks)", color: T.amber)
-                    ForEach(pending.prefix(rows)) { QueueRow(j: $0, now: snap.serverNow) }
+                    ForEach(pending.prefix(rows)) { QueueRow(g: $0, now: snap.serverNow) }
                     if pending.count > rows { More(n: pending.count - rows) }
                 }
             }
@@ -1221,7 +1301,7 @@ struct FullView: View {
 
 struct More: View {
     let n: Int
-    var body: some View { Text("  + \(n) more").font(T.mono(8.5)).foregroundColor(T.faint) }
+    var body: some View { Text("  + \(n) more rows").font(T.mono(8.5)).foregroundColor(T.faint) }
 }
 
 struct GPUSection: View {
@@ -1277,41 +1357,58 @@ struct FairShareSection: View {
 }
 
 struct RunRow: View {
-    let j: Job
+    let g: JobGroup
+    static func frac(_ j: Job) -> Double { j.limit.map { Double(j.elapsed) / Double(max($0, 1)) } ?? 0 }
     var body: some View {
-        let frac = j.limit.map { Double(j.elapsed) / Double(max($0, 1)) } ?? 0
+        let js = g.jobs
+        // The time shown for a group is the job closest to its limit: the one that ends first.
+        let lead = js.max { Self.frac($0) < Self.frac($1) } ?? js[0]
+        let live = js.contains { $0.st == "R" }
         VStack(alignment: .leading, spacing: 2.5) {
             HStack(spacing: 6) {
-                Text("▸").font(T.mono(10, .bold)).foregroundColor(j.st == "R" ? T.green : T.dim)
-                Text(j.name).font(T.mono(10.5)).foregroundColor(T.text).lineLimit(1).truncationMode(.middle)
+                Text("▸").font(T.mono(10, .bold)).foregroundColor(live ? T.green : T.dim)
+                Text(g.label).font(T.mono(10.5)).foregroundColor(T.text).lineLimit(1).truncationMode(.middle)
+                if js.count > 1 { Text("×\(js.count)").font(T.mono(9, .bold)).foregroundColor(T.green).fixedSize() }
                 Spacer(minLength: 4)
-                Chip(j: j)
-                Text("\(Fmt.hm(j.elapsed))/\(Fmt.hm(j.limit))").font(T.mono(9.5)).foregroundColor(T.dim).fixedSize()
+                Chip(types: g.gpuTotals)
+                Text("\(Fmt.hm(lead.elapsed))/\(Fmt.hm(lead.limit))").font(T.mono(9.5)).foregroundColor(T.dim).fixedSize()
             }
-            Meter(frac: frac, color: frac > 0.9 ? T.amber : T.green, height: 1.5, ticks: false).padding(.leading, 14)
+            // One thin meter per job while they fit; a single averaged one for a big group.
+            HStack(spacing: 3) {
+                if js.count <= 12 {
+                    ForEach(js) { j in bar(Self.frac(j)) }
+                } else {
+                    bar(js.reduce(0) { $0 + Self.frac($1) } / Double(js.count))
+                }
+            }
+            .padding(.leading, 14)
         }
         .contentShape(Rectangle())
-        .contextMenu { JobMenu(j: j) }
-        .help("\(j.id) · \(j.partition) · \(j.place)")
+        .contextMenu { JobMenu(g: g) }
+        .help(g.detail)
     }
+    func bar(_ f: Double) -> some View { Meter(frac: f, color: f > 0.9 ? T.amber : T.green, height: 1.5, ticks: false) }
 }
 
 struct QueueRow: View {
-    let j: Job
+    let g: JobGroup
     let now: Date
     var body: some View {
+        // Pending jobs arrive sorted by estimated start, so the first one is the next to run.
+        let first = g.jobs[0]
+        let reasons = Set(g.jobs.map { Fmt.reason($0.place) })
         HStack(spacing: 6) {
             Text("◇").font(T.mono(9.5, .bold)).foregroundColor(T.amber)
-            Text(j.name).font(T.mono(10.5)).foregroundColor(T.text.opacity(0.85)).lineLimit(1).truncationMode(.middle)
-            if j.tasks > 1 { Text("×\(j.tasks)").font(T.mono(9, .bold)).foregroundColor(T.amber).fixedSize() }
+            Text(g.label).font(T.mono(10.5)).foregroundColor(T.text.opacity(0.85)).lineLimit(1).truncationMode(.middle)
+            if g.tasks > 1 { Text("×\(g.tasks)").font(T.mono(9, .bold)).foregroundColor(T.amber).fixedSize() }
             Spacer(minLength: 4)
-            Chip(j: j)
-            Text(Fmt.reason(j.place)).font(T.mono(8, .bold)).foregroundColor(T.amber.opacity(0.9)).fixedSize()
-            Text(Fmt.eta(j.start, now: now)).font(T.mono(9.5)).foregroundColor(T.dim).frame(minWidth: 40, alignment: .trailing).fixedSize()
+            Chip(types: g.gpuTotals)
+            Text(reasons.count == 1 ? Fmt.reason(first.place) : "MIXED").font(T.mono(8, .bold)).foregroundColor(T.amber.opacity(0.9)).fixedSize()
+            Text(Fmt.eta(first.start, now: now)).font(T.mono(9.5)).foregroundColor(T.dim).frame(minWidth: 40, alignment: .trailing).fixedSize()
         }
         .contentShape(Rectangle())
-        .contextMenu { JobMenu(j: j) }
-        .help("\(j.id) · \(j.partition) · \(j.place)")
+        .contextMenu { JobMenu(g: g) }
+        .help(g.detail)
     }
 }
 
@@ -1384,7 +1481,7 @@ struct CompactView: View {
     var bar: some View { Rectangle().fill(T.chrome.opacity(0.3)).frame(width: 0.75, height: 22) }
     func stat(_ v: String, _ k: String, _ c: Color) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
-            Text(v).font(T.mono(20, .light)).foregroundColor(c).shadow(color: c.opacity(0.6), radius: 5)
+            Text(v).font(T.mono(20, .light)).foregroundColor(c)
             Text(k).font(T.mono(8, .medium)).tracking(1.2).foregroundColor(T.dim)
         }
     }
@@ -1447,6 +1544,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         AppDelegate.shared = self
         signal(SIGPIPE, SIG_IGN)
+        if CommandLine.arguments.contains("--light") { NSApp.appearance = NSAppearance(named: .aqua) }
+        if CommandLine.arguments.contains("--dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
         buildPanel()
         buildStatusItem()
         store.objectWillChange
@@ -1471,9 +1570,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor func renderPNG(_ path: String) {
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let view = HUDView(s: store)
+            .environment(\.colorScheme, dark ? .dark : .light)
             .padding(24)
-            .background(LinearGradient(colors: [Color(red: 0.16, green: 0.20, blue: 0.30), Color(red: 0.05, green: 0.06, blue: 0.10)],
+            .background(LinearGradient(colors: [Color(red: 0.66, green: 0.63, blue: 0.59), Color(red: 0.45, green: 0.47, blue: 0.49)],
                                        startPoint: .topLeading, endPoint: .bottomTrailing))
         let r = ImageRenderer(content: view)
         r.scale = 2
@@ -1498,7 +1599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.onMoved = { [weak self] in self?.savePosition() }
 
         let fx = NSVisualEffectView(frame: NSRect(origin: .zero, size: p.frame.size))
-        fx.material = .hudWindow
+        fx.material = .popover   // follows the system appearance (.hudWindow is always dark)
         fx.blendingMode = .behindWindow
         fx.state = .active
         fx.maskImage = AppDelegate.roundedMask(12)

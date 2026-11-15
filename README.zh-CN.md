@@ -59,6 +59,11 @@ cd slurm-hud
 | `historyHours` | `12` | 历史统计的时间窗口，1–336 小时 |
 | `showCluster`、`showHistory` | `true` | 关掉后，集群上对应的查询也不再执行 |
 | `extraSSHOptions` | `[]` | 每次 ssh 调用都会带上的额外参数，例如 `["-o", "Port=2222"]` |
+| `groupJobs` | `true` | 名字只差数字或末尾单字母的作业自动合并成一行（`eval_s0`、`eval_s1` → `eval_s* ×2`） |
+| `groupRules` | `[]` | 自定义分组，优先于自动规则：`[{"match": "^llama", "label": "LLM finetunes"}]`。`match` 是匹配作业名的正则，`label` 可省略 |
+
+合并后的一行会显示作业数、整组的 GPU 数、每个作业一条细进度条，以及最接近时限的那个作业的时间。
+悬停可看每个作业的明细，右键可复制全部作业 ID。HUD 会跟随系统的浅色 / 深色外观。
 
 改完后在菜单栏图标里点 **Reload Config**。
 
