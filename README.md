@@ -73,12 +73,34 @@ On first launch the HUD shows **CONFIG ERROR**: click **EDIT**, set `host`, save
 
 After editing, choose **Reload Config** from the menu bar item.
 
+### Several servers
+
+Add a `servers` list to watch more than one cluster. Each server gets its own window; every entry takes the
+top-level keys and overrides the ones it sets:
+
+```json
+{
+  "refreshSeconds": 60,
+  "servers": [
+    { "host": "cluster-a", "label": "A" },
+    { "host": "cluster-b", "label": "B", "maxRows": 4 }
+  ]
+}
+```
+
+The menu bar item then shows each server in config order (`▣ 18 ◇10 │ 4`) and has a submenu per server.
+Position, visibility, opacity, layer and compact mode are saved per server. Each server needs its own ssh
+master; **Reconnect SSH** opens one Terminal window per host.
+
 ### Grouping jobs
 
 Jobs that belong together share one row, in RUNNING and in QUEUE:
 
-- **Automatic.** Names that differ only by a number or a trailing one-letter token are grouped:
+- **Automatic.** Names that differ in just one field, a number or a trailing one-letter token, are grouped:
   `eval_s0`, `eval_s1` → `eval_s* ×2`; `ablate_a`, `ablate_b` → `ablate_* ×2`. Tasks of one job array are grouped too.
+  The label keeps every field the jobs share, so `run_d512_s3000_k2`, `run_d512_s3000_k3` → `run_d512_s3000_k* ×2`.
+  Names that differ in two fields (`d512_s3000` vs `d256_s7000`) are different configs and stay on separate rows;
+  for a grid sweep that you want on one row, add a rule.
 - **Your own rules.** `match` is a regular expression searched in the job name; the first matching rule wins.
   `label` is optional and defaults to the common part of the names.
 

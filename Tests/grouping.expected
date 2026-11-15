@@ -12,12 +12,36 @@ job 8000009_4 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=sweep
 job 8000009_[5-9] st=PD tasks=5 gpus=5 types=[l40s:1] start=1794790000 name=sweep
 job 8000010 st=PD tasks=1 gpus=1 types=[l40s:1] start=1794780000 name=sweep
 job 8000011 st=PD tasks=1 gpus=1 types=[l40s:1] start=- name=solo_job
+job 8000012 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=run_d512_s3000_k2_r0
+job 8000013 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=run_d512_s3000_k3_r0
+job 8000014 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=run_d256_s7000_k0_r0
+job 8000015 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=run_d512_s3000_k4_r0
+job 8000016 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=run_d256_s7000_c0_r0
+job 8000017 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=run_d256_s7000_c1_r0
+job 8000018 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=grid_lr1_wd1
+job 8000019 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=grid_lr1_wd2
+job 8000020 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=grid_lr2_wd1
+job 8000021 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=grid_lr2_wd2
+job 8000022 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a1_b1
+job 8000023 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a1_b1
+job 8000024 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a2_b1
+job 8000025 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a2_b1
+job 8000026 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a3_b2
+job 8000027 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a3_b2
+job 8000028 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a3_b3
+job 8000029 st=R tasks=1 gpus=1 types=[l40s:1] start=1794699000 name=dup_a3_b3
 share lab-ml fs=0.500 lfs=1.000
 hist ok=0 fail=0 timeout=0 cancel=0
 group eval_s* n=3 gpus=4 ids=8000001,8000002,8000003
 group ablate_* n=2 gpus=2 ids=8000004,8000005
 group ft_lr*_run n=2 gpus=2 ids=8000007,8000008
 group sweep n=2 gpus=2 ids=8000009_3,8000009_4
+group run_d512_s3000_k*_r0 n=3 gpus=3 ids=8000012,8000013,8000015
+group run_d256_s7000_c*_r0 n=2 gpus=2 ids=8000016,8000017
+group grid_lr1_wd* n=2 gpus=2 ids=8000018,8000019
+group grid_lr2_wd* n=2 gpus=2 ids=8000020,8000021
+group dup_a*_b1 n=4 gpus=4 ids=8000022,8000023,8000024,8000025
+group dup_a3_b* n=4 gpus=4 ids=8000026,8000027,8000028,8000029
 group sweep n=2 gpus=6 ids=8000010,8000009_[5-9]
 unavailable: 
-totals gpuRun=11 gpuPend=7 pendingTasks=7
+totals gpuRun=29 gpuPend=7 pendingTasks=7

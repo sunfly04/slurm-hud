@@ -13,15 +13,21 @@ fair-share (LevelFS) and cluster GPU availability. User-facing docs: README.md (
   - `Remote.script`: bash sent over ssh stdin. It prints `@@TAG` sections (HOST, NOW, ENV, JOBS, SHARE, NODES, HIST, END)
     and `@@NA <SECTION>` when a query fails, so a failure never looks like an empty result. A fatal problem prints `@@ERR`.
   - `Parser`: turns that text into `Snapshot`. `Parser.describe` gives a deterministic dump for tests.
-  - `Grouper`: folds jobs into `JobGroup` rows. Config `groupRules` (regex on the name) win; otherwise names that are equal
-    after masking numbers and a trailing one-letter token share a row. `Parser.describe` prints multi-job groups (`Tests/grouping.txt`).
+  - `Grouper`: folds jobs into `JobGroup` rows. Config `groupRules` (regex on the name) win. Otherwise `parts()` splits a name
+    into fixed text and fields (numbers incl. `1e-4`/`0.5`, plus a trailing one-letter token); names with the same text are
+    candidates, and `split()` keeps only those that differ in one field on a row. Labels show shared fields and `*` for the
+    varying one. `Parser.describe` prints multi-job groups (`Tests/grouping.txt`).
   - `T` (theme): Morandi palette. Every colour is `T.dyn(dark, light)` and follows the system appearance; don't add fixed
     `Color(red:…)` or `.white`/`.black` in views. `--light` / `--dark` force one for `--render`.
   - `SSH`: `Process` wrapper for `/usr/bin/ssh` and the ControlMaster helpers.
   - `Store`: the poller (`ObservableObject`). It owns link state, backoff, the config generation and the reconnect flow.
   - Views (`HUDView` and below): SwiftUI. `Canvas` draws the grid, meters, sparkline and GPU blocks.
-  - `HUDPanel` / `AppDelegate`: borderless non-activating `NSPanel` (desktop level by default, optionally floating),
-    the status item menu, and persistence in `UserDefaults` (domain `io.github.slurm-hud`).
+  - Several servers: `Config.loadAll()` returns one config per entry of an optional `servers` list, each merged over
+    the top-level keys (no list = one server, the old format). Each gets its own `Store` + `ServerHUD`.
+  - `HUDPanel` / `ServerHUD` / `AppDelegate`: `ServerHUD` owns one server's borderless non-activating `NSPanel`
+    (desktop level by default, optionally floating). `AppDelegate.sync` matches windows to the config on launch and
+    reload, and owns the single status item and its menu. UI settings live in `UserDefaults` (domain `io.github.slurm-hud`)
+    through `Prefs` as `<key>.<host>`; the first server falls back to the pre-multi-server keys (`hud.x`, `compact`, …).
 - `Info.plist`: `LSUIElement` (no Dock icon). `build.sh` compiles with `swiftc` (no Xcode project); `./build.sh universal`
   builds arm64 + x86_64 and writes `build/SlurmHUD.zip`.
 - `Tests/`: captured probe outputs (`*.txt`) plus golden parser dumps (`*.expected`); `Tests/run.sh` diffs them.
@@ -54,11 +60,13 @@ RSS overstates it because it counts shared frameworks.
     ssh then fails locally instead of falling back to a direct login.
   - With no master, the app tries one direct login. Any failure that reached the server sets `directFailed`;
     after that it only polls the local socket. Pure network errors (refused, unreachable, DNS) back off exponentially, up to 15 min.
+  - With several servers, `DirectGate` rations direct logins per ssh target (`Config.target` = host + `extraSSHOptions`)
+    across all windows: one attempt at a time, none after one failed, until Reload Config. Keep every direct attempt behind it.
 - The ControlPath is resolved once with `ssh -G` and passed **expanded** to every call (fetch, check, reconnect).
   Overriding ProxyCommand can change a `%C` hash, so a pattern must not be used here. `extraSSHOptions` goes to all of those calls too.
 - `ControlMaster=no` on fetches is deliberate. A fetch that became a ControlPersist master would keep the
   stdout pipe open and hang `readDataToEndOfFile`.
-- Reconnect writes `<config dir>/connect.command` and opens it in Terminal. That script runs
+- Reconnect writes `<config dir>/connect-<host>-<hash of target>.command` and opens it in Terminal. That script runs
   `ssh -fN -o ControlMaster=yes -o ControlPersist=yes <host>`, so the user does MFA once. Every interpolated value goes through `shq()`.
 - Remote env: non-login shells on some clusters lack `SLURM_CONF`/PATH. The first fetch uses `bash -l -s`. It caches
   `SLURM_CONF|bindir` in UserDefaults (`remoteEnv.<host>`); later fetches run plain `bash -s` with exports.

@@ -50,6 +50,9 @@ struct Config: Codable, Equatable {
         historyHours = min(max(historyHours, 1), 24 * 14)
     }
 
+    /// What ssh actually connects to: the host plus the options that can change user, port or destination.
+    var target: String { ([host] + extraSSHOptions).joined(separator: "\u{1}") }
+
     /// A host that ssh could read as an option (or that isn't a single word) is refused outright.
     var displayLabel: String { label.isEmpty ? (host.isEmpty ? "SLURM" : host).uppercased() : label }
 
@@ -70,20 +73,35 @@ struct Config: Codable, Equatable {
     }
     static var file: URL { dir.appendingPathComponent("config.json") }
 
-    /// Returns the config plus a message when it can't be used. A broken file is never overwritten.
-    static func load() -> (Config, String?) {
+    /// One config per server, each with a message when it can't be used. A broken file is never overwritten.
+    /// Without a `servers` list the file describes one server. With one, every entry is merged over the
+    /// top-level keys, so shared settings are written once: `{"refreshSeconds": 60, "servers": [{"host": "a"}, {"host": "b"}]}`.
+    static func loadAll() -> [(Config, String?)] {
         guard let data = try? Data(contentsOf: file) else {
             let c = Config()
             c.save()
-            return (c, nil)
+            return [(c, c.problem)]
         }
-        do {
-            var c = try JSONDecoder().decode(Config.self, from: data)
-            c.clamp()
-            return (c, c.problem)
-        } catch {
-            return (Config(), "config: config.json is not valid JSON")
+        guard let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [(Config(), "config: config.json is not valid JSON")]
         }
+        guard let raw = top["servers"] else { return [decode(data, "config.json is not valid JSON")] }
+        guard let list = raw as? [Any] else { return [(Config(), "config: \"servers\" must be a list of objects")] }
+        if list.isEmpty { return [decode(data, "config.json is not valid JSON")] }
+        var base = top
+        base.removeValue(forKey: "servers")
+        return list.enumerated().map { i, e in
+            guard let o = e as? [String: Any], let d = try? JSONSerialization.data(withJSONObject: base.merging(o) { $1 }) else {
+                return (Config(), "config: servers[\(i)] must be an object")
+            }
+            return decode(d, "servers[\(i)] has a value of the wrong type")
+        }
+    }
+
+    private static func decode(_ data: Data, _ err: String) -> (Config, String?) {
+        guard var c = try? JSONDecoder().decode(Config.self, from: data) else { return (Config(), "config: " + err) }
+        c.clamp()
+        return (c, c.problem)
     }
 
     func save() {
@@ -166,23 +184,89 @@ struct JobGroup: Identifiable, Equatable {
 }
 
 enum Grouper {
-    private static let digits = try! NSRegularExpression(pattern: "[0-9]+")
+    // A number field: an integer, a decimal or scientific notation, so `lr1e-4` and `lr0.003` are one field each.
+    private static let number = try! NSRegularExpression(pattern: "[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?")
     private static var cache: [String: NSRegularExpression?] = [:]   // main thread only
 
-    /// Automatic rule: names that are equal once every number is masked and a trailing one-letter
-    /// token is dropped belong together (`eval_s0`/`eval_s1`, `ablate_a`/`ablate_b`, `lr1e-4`/`lr3e-5`).
-    static func stem(_ name: String) -> String {
-        var s = digits.stringByReplacingMatches(in: name, range: NSRange(name.startIndex..., in: name), withTemplate: "#")
-        let c = Array(s)
-        if c.count >= 3, c[c.count - 1].isLetter, "_-.".contains(c[c.count - 2]) { s = String(c.dropLast()) + "*" }
-        return s
+    /// A name split into fixed text and variable fields: `name == text[0] + field[0] + text[1] + … + text.last`.
+    /// The fields are the numbers plus a trailing one-letter token (`ablate_a`), whose text before it ends in `_`, `-` or `.`.
+    struct Parts: Equatable {
+        var text: [String]
+        var field: [String]
     }
 
-    /// Common prefix + "*" + common suffix, never cutting through the middle of a number.
+    static func parts(_ name: String) -> Parts {
+        let ns = name as NSString
+        var p = Parts(text: [], field: [])
+        var at = 0
+        for m in number.matches(in: name, range: NSRange(location: 0, length: ns.length)) {
+            p.text.append(ns.substring(with: NSRange(location: at, length: m.range.location - at)))
+            p.field.append(ns.substring(with: m.range))
+            at = m.range.location + m.range.length
+        }
+        var tail = ns.substring(from: at)
+        let c = Array(tail)
+        if name.count >= 3, c.count >= 2, c[c.count - 1].isLetter, "_-.".contains(c[c.count - 2]) {
+            p.text.append(String(c.dropLast()))
+            p.field.append(String(c[c.count - 1]))
+            tail = ""
+        }
+        p.text.append(tail)
+        return p
+    }
+
+    /// Automatic rule, step 1: names whose fixed text is the same are candidates (`eval_s0`/`eval_s1`, `ablate_a`/`ablate_b`).
+    static func stem(_ name: String) -> String { parts(name).text.joined(separator: "\u{1}") }
+
+    /// Step 2, inside one stem: only names that differ in a single field share a row, so two configs that happen to have
+    /// the same shape (`a576_s3000_k2`, `a256_s7000_k0`) stay apart. The field that merges the most jobs is chosen
+    /// (the rightmost on a tie); the jobs it leaves unmerged (a lone name, or only copies of one name)
+    /// get another try with the remaining fields.
+    static func split(_ jobs: [Job]) -> [[Job]] {
+        let fs = jobs.map { parts($0.name).field }
+        let n = fs.first?.count ?? 0
+        guard jobs.count > 1, n > 0 else { return [jobs] }
+        func key(_ i: Int, _ k: Int) -> [String] { var f = fs[i]; f[k] = "\u{1}"; return f }
+        var best = 0, bestCount = Int.max
+        for k in 0..<n {
+            let c = Set(jobs.indices.map { key($0, k) }).count
+            if c <= bestCount { best = k; bestCount = c }
+        }
+        var order: [[String]] = []
+        var buckets: [[String]: [Int]] = [:]
+        for i in jobs.indices {
+            let kk = key(i, best)
+            if buckets[kk] == nil { order.append(kk) }
+            buckets[kk, default: []].append(i)
+        }
+        let groups = order.map { buckets[$0]! }
+        func merged(_ g: [Int]) -> Bool { Set(g.map { fs[$0] }).count > 1 }
+        let alone = groups.filter { !merged($0) }.flatMap { $0 }
+        guard Set(alone.map { fs[$0] }).count > 1, alone.count < jobs.count else { return groups.map { $0.map { jobs[$0] } } }
+        let rest = split(alone.map { jobs[$0] })
+        var out: [[Job]] = groups.filter(merged).map { $0.map { jobs[$0] } } + rest
+        let pos = Dictionary(jobs.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        out.sort { pos[$0[0].id]! < pos[$1[0].id]! }
+        return out
+    }
+
+    /// Names with the same shape keep every field they agree on and show `*` for the others (`a576_s3000_k*_r0`).
+    /// Anything else (a rule's group) falls back to common prefix + "*" + common suffix, never cutting through a number.
     static func label(_ names: [String]) -> String {
         var seen = Set<String>()
-        let u = names.filter { seen.insert($0).inserted }.map(Array.init)
-        guard u.count > 1, let a = u.first else { return names.first ?? "" }
+        let uniq = names.filter { seen.insert($0).inserted }
+        guard uniq.count > 1 else { return names.first ?? "" }
+        let ps = uniq.map(parts)
+        if ps.allSatisfy({ $0.text == ps[0].text }) {
+            var s = ""
+            for (i, t) in ps[0].text.enumerated() {
+                s += t
+                if i < ps[0].field.count { s += ps.allSatisfy({ $0.field[i] == ps[0].field[i] }) ? ps[0].field[i] : "*" }
+            }
+            return s
+        }
+        let u = uniq.map(Array.init)
+        let a = u[0]
         let minLen = u.map(\.count).min() ?? 0
         var p = 0
         while p < minLen, u.allSatisfy({ $0[p] == a[p] }) { p += 1 }
@@ -218,10 +302,21 @@ enum Grouper {
             if buckets[key] == nil { order.append(key) }
             buckets[key, default: []].append(j)
         }
-        return order.map { k in
+        // Split the automatic buckets, then put every row back at its first job's position.
+        let pos = Dictionary(jobs.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var rows: [JobGroup] = []
+        for k in order {
             let js = buckets[k] ?? []
-            return JobGroup(id: k, label: fixed[k] ?? label(js.map(\.name)), jobs: js)
+            if k.hasPrefix("rule:") {
+                rows.append(JobGroup(id: k, label: fixed[k] ?? label(js.map(\.name)), jobs: js))
+            } else {
+                for part in split(js) {
+                    let l = label(part.map(\.name))
+                    rows.append(JobGroup(id: "auto:\(l)#\(part[0].id)", label: l, jobs: part))   // a job may be named like a label
+                }
+            }
         }
+        return rows.sorted { (pos[$0.jobs[0].id] ?? 0) < (pos[$1.jobs[0].id] ?? 0) }
     }
 }
 
@@ -642,6 +737,45 @@ enum SSH {
 
 // MARK: - Store / poller
 
+/// Per-server UI settings in UserDefaults, stored as `<key>.<id>`. The first server also reads the
+/// pre-multi-server keys (`hud.x`, `compact`, …) until it has its own, so an upgrade keeps the old window.
+struct Prefs {
+    let id: String
+    let legacy: Bool
+    private var d: UserDefaults { .standard }
+    func object(_ k: String) -> Any? { d.object(forKey: "\(k).\(id)") ?? (legacy ? d.object(forKey: k) : nil) }
+    func bool(_ k: String) -> Bool { object(k) as? Bool ?? false }
+    func double(_ k: String) -> Double? { (object(k) as? NSNumber)?.doubleValue }
+    func string(_ k: String) -> String? { object(k) as? String }
+    func set(_ v: Any, _ k: String) { d.set(v, forKey: "\(k).\(id)") }
+}
+
+/// Direct (non-master) logins are rationed per ssh target across all windows, so two entries for the same
+/// host (or a window being replaced on reload while its fetch is still out) never knock twice:
+/// at most one direct attempt at a time, and none after one failed until the user reloads the config.
+enum DirectGate {
+    enum Verdict { case go, busy, failed }
+    private static let lock = NSLock()
+    private static var busy = Set<String>()
+    private static var failed = Set<String>()
+
+    static func begin(_ t: String) -> Verdict {
+        lock.lock(); defer { lock.unlock() }
+        if failed.contains(t) { return .failed }
+        if busy.contains(t) { return .busy }
+        busy.insert(t)
+        return .go
+    }
+    /// Releases the target and, in the same step, records a failure, so no other window can slip in between.
+    static func end(_ t: String, failed f: Bool) {
+        lock.lock()
+        busy.remove(t)
+        if f { failed.insert(t) }
+        lock.unlock()
+    }
+    static func reset() { lock.lock(); failed.removeAll(); lock.unlock() }
+}
+
 final class Store: ObservableObject {
     enum Link: Equatable { case boot, live, auth, down(String), error(String), config(String) }
 
@@ -649,9 +783,11 @@ final class Store: ObservableObject {
     @Published private(set) var link: Link = .boot
     @Published private(set) var syncing = false
     @Published private(set) var spark: [Sample] = []
-    @Published private(set) var compact = UserDefaults.standard.bool(forKey: "compact")
+    @Published private(set) var compact: Bool
     @Published private(set) var cfg: Config
     private var cfgError: String?
+    let prefs: Prefs
+    private var stopped = false
 
     private var timer: Timer?
     private var fastUntil = Date.distantPast
@@ -661,19 +797,26 @@ final class Store: ObservableObject {
     private var directFailed = false    // a direct login reached the server and failed: from now on use the master socket only
     private var backoff = 30.0          // retry delay for network-level failures of direct attempts
 
-    init() {
-        let (c, e) = Config.load()
+    init(_ c: Config, _ e: String?, prefs: Prefs) {
         cfg = c
         cfgError = e
+        self.prefs = prefs
+        compact = prefs.bool("compact")
     }
 
     func toggleCompact() {
         compact.toggle()
-        UserDefaults.standard.set(compact, forKey: "compact")
+        prefs.set(compact, "compact")
     }
 
-    func reloadConfig() {
-        let (c, e) = Config.load()
+    /// The server was removed from the config: no more polling, and an in-flight result is dropped.
+    func stop() {
+        stopped = true
+        gen += 1
+        timer?.invalidate()
+    }
+
+    func apply(_ c: Config, _ e: String?) {
         cfg = c
         cfgError = e
         gen += 1
@@ -709,12 +852,14 @@ final class Store: ObservableObject {
     }
 
     func refresh() {
-        guard !syncing else { return }
+        guard !syncing, !stopped else { return }
         timer?.invalidate()
         if let d = demoText { applyDemo(d); return }
         if let e = cfgError { link = .config(e); return }   // wait for Reload Config
         syncing = true
-        let cfg = self.cfg, myGen = gen, envKey = "remoteEnv." + cfg.host
+        let cfg = self.cfg, myGen = gen
+        // The old key for a plain host; options that may point ssh elsewhere get their own cache entry.
+        let envKey = "remoteEnv." + (cfg.extraSSHOptions.isEmpty ? cfg.host : cfg.target)
         let cached = UserDefaults.standard.string(forKey: envKey)
         let resolved = cpResolved, knownCP = cp, masterOnlyMode = directFailed
 
@@ -723,7 +868,8 @@ final class Store: ObservableObject {
             let master = SSH.masterUp(cfg, cp)
             var r: SSH.Result?
             var parsed: Parser.Out?
-            if master || !masterOnlyMode {
+            let gate: DirectGate.Verdict = master || masterOnlyMode ? .failed : DirectGate.begin(cfg.target)
+            if master || gate == .go {
                 var prelude = ""
                 var remote = "bash -l -s"
                 if let c = cached {
@@ -739,14 +885,23 @@ final class Store: ObservableObject {
                 if res.status == 0 && !res.timedOut { parsed = Parser.parse(res.out) }
                 r = res
             }
+            // Judged here, not on the main queue: the result may belong to a removed window or an old config,
+            // and a failed login must count either way.
+            if !master && gate == .go, let r { DirectGate.end(cfg.target, failed: Store.directFailure(r, parsed)) }
             DispatchQueue.main.async {
-                guard myGen == self.gen else {   // config changed while we were out
+                guard myGen == self.gen else {   // config changed (or the server was removed) while we were out
                     self.syncing = false
                     self.refresh()
                     return
                 }
                 self.cp = cp
                 self.cpResolved = true
+                if !master && gate == .busy {   // another window is mid-login to this target: look again shortly
+                    self.syncing = false
+                    self.schedule(5)
+                    return
+                }
+                if !master && !masterOnlyMode && gate == .failed { self.directFailed = true }   // another window's login failed
                 self.finish(r, parsed, usedLogin: cached == nil, viaMaster: master, envKey: envKey)
             }
         }
@@ -798,6 +953,14 @@ final class Store: ObservableObject {
         scheduleNext()
     }
 
+    /// A direct login that must not be repeated: it hung, or it reached the server and failed for a reason other
+    /// than the network. Mirrors the branches of `finish` that set `directFailed`.
+    static func directFailure(_ r: SSH.Result, _ p: Parser.Out?) -> Bool {
+        if r.timedOut { return true }
+        if let p, p.err != nil || p.snap != nil { return false }
+        return !SSH.isNetworkError(r.err)
+    }
+
     /// Keep showing the last good data for a section whose query failed this round, marked stale.
     private func carryOver(from old: Snapshot, into sn: inout Snapshot) {
         if sn.unavailable.contains("SHARE"), !old.shares.isEmpty {
@@ -834,6 +997,11 @@ final class Store: ObservableObject {
         case .error: iv = fast ? 4 : 60
         case .config: return
         }
+        schedule(iv)
+    }
+
+    private func schedule(_ iv: Double) {
+        timer?.invalidate()
         let t = Timer(timeInterval: iv, repeats: false) { [weak self] _ in self?.refresh() }
         t.tolerance = iv * 0.2
         RunLoop.main.add(t, forMode: .common)
@@ -842,7 +1010,7 @@ final class Store: ObservableObject {
 
     func wake() {
         timer?.invalidate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.refresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.refresh() }
     }
 
     /// Opens Terminal with a one-shot script that starts a persistent ssh master (you do MFA there once).
@@ -864,13 +1032,27 @@ final class Store: ObservableObject {
         fi
 
         """
-        let url = Config.dir.appendingPathComponent("connect.command")
+        // One script per host, so two servers reconnecting at once don't overwrite each other's.
+        let safe = String(cfg.host.map { $0.isLetter || $0.isNumber || "._-".contains($0) ? $0 : "_" })
+        let hash = cfg.target.utf8.reduce(UInt32(2166136261)) { ($0 ^ UInt32($1)) &* 16777619 }   // FNV-1a: stable across launches
+        let url = Config.dir.appendingPathComponent("connect-\(safe)-\(String(hash, radix: 16)).command")
         try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
         try? body.write(to: url, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         NSWorkspace.shared.open(url)
         fastUntil = Date().addingTimeInterval(180)
         if !syncing { scheduleNext() }
+    }
+
+    /// Menu bar summary: running GPUs and queued tasks, or what is wrong.
+    var shortStatus: String {
+        switch link {
+        case .live, .boot:
+            guard let s = snap else { return "…" }
+            return s.pendingTasks > 0 ? "\(s.gpuRun) ◇\(s.pendingTasks)" : "\(s.gpuRun)"
+        case .auth: return "⚠︎"
+        default: return "✕"
+        }
     }
 
     var statusText: String {
@@ -970,7 +1152,8 @@ struct RootMenu: View {
         Button("Refresh Now") { s.refresh() }
         Button(s.compact ? "Expand" : "Compact") { s.toggleCompact() }
         Divider()
-        Button(AppDelegate.shared?.layer == .desktop ? "Float Above Windows" : "Pin to Desktop (behind windows)") { AppDelegate.shared?.toggleLayer() }
+        let hud = AppDelegate.shared?.hud(for: s)
+        Button(hud?.layer == .desktop ? "Float Above Windows" : "Pin to Desktop (behind windows)") { hud?.toggleLayer() }
         Button("Reconnect SSH…") { s.reconnect() }
         Divider()
         Button("Quit SlurmHUD") { NSApp.terminate(nil) }
@@ -1040,7 +1223,7 @@ struct Banner: View {
             switch s.link {
             case .config:
                 Button("EDIT") { AppDelegate.shared?.editConfig() }.buttonStyle(HUDButton(color: color))
-                Button("RELOAD") { s.reloadConfig() }.buttonStyle(HUDButton(color: color))
+                Button("RELOAD") { AppDelegate.shared?.reloadConfig() }.buttonStyle(HUDButton(color: color))
             case .error:
                 Button("RETRY") { s.refresh() }.buttonStyle(HUDButton(color: color))
             default:
@@ -1530,60 +1713,34 @@ final class HUDPanel: NSPanel {
 
 enum Layer: String { case float, desktop }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    static weak var shared: AppDelegate?
-    let store = Store()
+/// One server's floating window. Its position, visibility, layer, opacity and click-through are saved per server.
+final class ServerHUD: NSObject {
+    let store: Store
+    let index: Int
     var panel: HUDPanel!
     var host: HostView<HUDView>!
-    var item: NSStatusItem!
-    var bag = Set<AnyCancellable>()
-    let defaults = UserDefaults.standard
-    var layer: Layer = Layer(rawValue: UserDefaults.standard.string(forKey: "hud.layer") ?? "") ?? .desktop
+    var layer: Layer
+    private var bag = Set<AnyCancellable>()
     private var layoutQueued = false
+    private var prefs: Prefs { store.prefs }
 
-    func applicationDidFinishLaunching(_ n: Notification) {
-        AppDelegate.shared = self
-        signal(SIGPIPE, SIG_IGN)
-        if CommandLine.arguments.contains("--light") { NSApp.appearance = NSAppearance(named: .aqua) }
-        if CommandLine.arguments.contains("--dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
+    init(store: Store, index: Int) {
+        self.store = store
+        self.index = index
+        layer = Layer(rawValue: store.prefs.string("hud.layer") ?? "") ?? .desktop
+        super.init()
         buildPanel()
-        buildStatusItem()
         store.objectWillChange
             .sink { [weak self] _ in self?.scheduleRelayout() }
             .store(in: &bag)
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.store.wake()
-        }
-        if let i = CommandLine.arguments.firstIndex(of: "--demo"), i + 1 < CommandLine.arguments.count {
-            store.demoText = (try? String(contentsOfFile: CommandLine.arguments[i + 1], encoding: .utf8)) ?? ""
-        }
-        // Debug: `SlurmHUD --render out.png` writes the HUD to a PNG after each update.
-        // Hooked before the first refresh so synchronous state changes (e.g. a config error) are captured too.
-        if let i = CommandLine.arguments.firstIndex(of: "--render"), i + 1 < CommandLine.arguments.count {
-            let path = CommandLine.arguments[i + 1]
-            store.objectWillChange
-                .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
-                .sink { [weak self] _ in self?.renderPNG(path) }
-                .store(in: &bag)
-        }
-        store.refresh()
     }
 
-    @MainActor func renderPNG(_ path: String) {
-        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let view = HUDView(s: store)
-            .environment(\.colorScheme, dark ? .dark : .light)
-            .padding(24)
-            .background(LinearGradient(colors: [Color(red: 0.66, green: 0.63, blue: 0.59), Color(red: 0.45, green: 0.47, blue: 0.49)],
-                                       startPoint: .topLeading, endPoint: .bottomTrailing))
-        let r = ImageRenderer(content: view)
-        r.scale = 2
-        guard let img = r.nsImage, let tiff = img.tiffRepresentation,
-              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
-        try? png.write(to: URL(fileURLWithPath: path))
+    func close() {
+        store.stop()
+        bag.removeAll()
+        panel.orderOut(nil)
+        panel.close()
     }
-
-    // MARK: panel
 
     func buildPanel() {
         let p = HUDPanel(contentRect: initialFrame(height: 120), styleMask: [.borderless, .nonactivatingPanel],
@@ -1602,7 +1759,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fx.material = .popover   // follows the system appearance (.hudWindow is always dark)
         fx.blendingMode = .behindWindow
         fx.state = .active
-        fx.maskImage = AppDelegate.roundedMask(12)
+        fx.maskImage = ServerHUD.roundedMask(12)
         fx.autoresizingMask = [.width, .height]
 
         let h = HostView(rootView: HUDView(s: store))
@@ -1615,10 +1772,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel = p
         host = h
         applyLayer()
-        p.alphaValue = defaults.object(forKey: "hud.alpha") == nil ? 1 : CGFloat(defaults.double(forKey: "hud.alpha"))
-        p.ignoresMouseEvents = defaults.bool(forKey: "hud.clickThrough")
+        p.alphaValue = CGFloat(prefs.double("hud.alpha") ?? 1)
+        p.ignoresMouseEvents = prefs.bool("hud.clickThrough")
         relayout()
-        if !defaults.bool(forKey: "hud.hidden") { p.orderFrontRegardless() }
+        if !prefs.bool("hud.hidden") { p.orderFrontRegardless() }
     }
 
     static func roundedMask(_ r: CGFloat) -> NSImage {
@@ -1633,17 +1790,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return img
     }
 
+    /// The saved position, or else the top-right corner, with each further server one column to the left.
     func initialFrame(height: CGFloat) -> NSRect {
-        if defaults.object(forKey: "hud.x") != nil {
-            let x = defaults.double(forKey: "hud.x"), top = defaults.double(forKey: "hud.top")
-            return clamped(NSRect(x: x, y: top - height, width: hudWidth, height: height))
+        if let x = prefs.double("hud.x"), let top = prefs.double("hud.top") {
+            return ServerHUD.clamped(NSRect(x: x, y: top - height, width: hudWidth, height: height))
         }
         let vf = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        return NSRect(x: vf.maxX - hudWidth - 18, y: vf.maxY - 18 - height, width: hudWidth, height: height)
+        let x = vf.maxX - (hudWidth + 18) * CGFloat(index + 1)
+        return ServerHUD.clamped(NSRect(x: x, y: vf.maxY - 18 - height, width: hudWidth, height: height))
     }
 
     /// Keep the whole panel on the screen it mostly sits on (top edge wins if it is taller than the screen).
-    func clamped(_ f: NSRect) -> NSRect {
+    static func clamped(_ f: NSRect) -> NSRect {
         func overlap(_ s: NSScreen) -> CGFloat { let i = s.frame.intersection(f); return i.isNull ? 0 : i.width * i.height }
         let screen = NSScreen.screens.max { overlap($0) < overlap($1) }.flatMap { overlap($0) > 0 ? $0 : nil } ?? NSScreen.main
         guard let v = screen?.visibleFrame else { return f }
@@ -1654,8 +1812,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func savePosition() {
-        defaults.set(Double(panel.frame.minX), forKey: "hud.x")
-        defaults.set(Double(panel.frame.maxY), forKey: "hud.top")
+        prefs.set(Double(panel.frame.minX), "hud.x")
+        prefs.set(Double(panel.frame.maxY), "hud.top")
     }
 
     /// Several @Published fields change per refresh; measure the layout once per main-loop turn.
@@ -1677,10 +1835,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let top = f.maxY
             f.size = size
             f.origin.y = top - size.height
-            panel.setFrame(clamped(f), display: true)
+            panel.setFrame(ServerHUD.clamped(f), display: true)
             panel.invalidateShadow()
         }
-        updateStatusTitle()
+        AppDelegate.shared?.updateStatusTitle()
     }
 
     func applyLayer() {
@@ -1696,9 +1854,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func toggleLayer() {
         layer = layer == .float ? .desktop : .float
-        defaults.set(layer.rawValue, forKey: "hud.layer")
+        prefs.set(layer.rawValue, "hud.layer")
         applyLayer()
         if panel.isVisible { panel.orderFrontRegardless() }   // a hidden HUD stays hidden
+    }
+
+    /// This server's part of the status menu: flat when it is the only server, a submenu otherwise.
+    func addItems(to m: NSMenu, shortcuts: Bool) {
+        func add(_ title: String, _ sel: Selector, _ key: String = "", on: Bool = false) {
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: shortcuts ? key : "")
+            it.target = self
+            it.state = on ? .on : .off
+            m.addItem(it)
+        }
+        add("Refresh Now", #selector(refreshNow), "r")
+        add(panel.isVisible ? "Hide HUD" : "Show HUD", #selector(toggleHUD), "h")
+        add("Compact Mode", #selector(toggleCompact), on: store.compact)
+        m.addItem(.separator())
+        add("Float Above Windows", #selector(setFloat), on: layer == .float)
+        add("Pin to Desktop (behind windows)", #selector(setDesktop), on: layer == .desktop)
+        let op = NSMenuItem(title: "Opacity", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for v in [100, 90, 80, 70, 60, 50] {
+            let it = NSMenuItem(title: "\(v)%", action: #selector(setOpacity(_:)), keyEquivalent: "")
+            it.target = self
+            it.tag = v
+            it.state = abs(panel.alphaValue * 100 - CGFloat(v)) < 1 ? .on : .off
+            sub.addItem(it)
+        }
+        op.submenu = sub
+        m.addItem(op)
+        add("Click-Through (lock in place)", #selector(toggleClickThrough), on: panel.ignoresMouseEvents)
+        m.addItem(.separator())
+        add("Reconnect SSH (MFA)…", #selector(reconnect))
+    }
+
+    var menuTitle: String { "\(store.cfg.displayLabel) · \(store.cfg.host)  —  \(store.statusText)" }
+
+    @objc func refreshNow() { store.refresh() }
+    @objc func toggleCompact() { store.toggleCompact() }
+    @objc func setFloat() { if layer != .float { toggleLayer() } }
+    @objc func setDesktop() { if layer != .desktop { toggleLayer() } }
+    @objc func reconnect() { store.reconnect() }
+    @objc func toggleHUD() {
+        if panel.isVisible { panel.orderOut(nil) } else { panel.orderFrontRegardless() }
+        prefs.set(!panel.isVisible, "hud.hidden")
+    }
+    @objc func setOpacity(_ sender: NSMenuItem) {
+        panel.alphaValue = CGFloat(sender.tag) / 100
+        prefs.set(Double(sender.tag) / 100, "hud.alpha")
+    }
+    @objc func toggleClickThrough() {
+        panel.ignoresMouseEvents.toggle()
+        prefs.set(panel.ignoresMouseEvents, "hud.clickThrough")
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    static weak var shared: AppDelegate?
+    var huds: [ServerHUD] = []
+    var item: NSStatusItem!
+    var demoText: String?
+    var renderPath: String?
+    private var renderSub: AnyCancellable?
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        AppDelegate.shared = self
+        signal(SIGPIPE, SIG_IGN)
+        if CommandLine.arguments.contains("--light") { NSApp.appearance = NSAppearance(named: .aqua) }
+        if CommandLine.arguments.contains("--dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
+        if let i = CommandLine.arguments.firstIndex(of: "--demo"), i + 1 < CommandLine.arguments.count {
+            demoText = (try? String(contentsOfFile: CommandLine.arguments[i + 1], encoding: .utf8)) ?? ""
+        }
+        // Debug: `SlurmHUD --render out.png` writes every server's HUD, side by side, to a PNG after each update.
+        // Hooked (in sync) before the first refresh so synchronous state changes (e.g. a config error) are captured too.
+        if let i = CommandLine.arguments.firstIndex(of: "--render"), i + 1 < CommandLine.arguments.count {
+            renderPath = CommandLine.arguments[i + 1]
+        }
+        buildStatusItem()
+        sync(Config.loadAll(), start: false)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.huds.forEach { $0.store.wake() }
+        }
+        huds.forEach { $0.store.refresh() }
+    }
+
+    /// Match the windows to the config: servers keep their window by position in the list, new ones get a
+    /// window, removed ones lose theirs. A server whose host changed starts over (`Store.apply`).
+    @MainActor func sync(_ list: [(Config, String?)], start: Bool = true) {
+        var seen: [String: Int] = [:]
+        let ids: [String] = list.map { c, _ in
+            let n = seen[c.host, default: 0]
+            seen[c.host] = n + 1
+            return n == 0 ? c.host : "\(c.host)#\(n + 1)"   // the same host twice keeps two sets of settings
+        }
+        while huds.count > list.count { huds.removeLast().close() }
+        var fresh: [Store] = []
+        for (i, (c, e)) in list.enumerated() {
+            if i < huds.count, huds[i].store.prefs.id == ids[i] {
+                huds[i].store.apply(c, e)
+                continue
+            }
+            let s = Store(c, e, prefs: Prefs(id: ids[i], legacy: i == 0))
+            s.demoText = demoText
+            let h = ServerHUD(store: s, index: i)
+            if i < huds.count { huds[i].close(); huds[i] = h } else { huds.append(h) }
+            fresh.append(s)
+        }
+        if let path = renderPath {   // follow the current set of servers
+            renderSub = Publishers.MergeMany(huds.map { $0.store.objectWillChange })
+                .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+                .sink { [weak self] _ in self?.renderPNG(path) }
+            // Replacing the subscription drops a render that was still waiting out its debounce.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.renderPNG(path) }
+        }
+        if start { fresh.forEach { $0.refresh() } }
+        updateStatusTitle()
+    }
+
+    func hud(for s: Store) -> ServerHUD? { huds.first { $0.store === s } }
+
+    @MainActor func renderPNG(_ path: String) {
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let stores = huds.map(\.store)
+        let view = HStack(alignment: .top, spacing: 18) {
+            ForEach(stores.indices, id: \.self) { HUDView(s: stores[$0]) }
+        }
+            .environment(\.colorScheme, dark ? .dark : .light)
+            .padding(24)
+            .background(LinearGradient(colors: [Color(red: 0.66, green: 0.63, blue: 0.59), Color(red: 0.45, green: 0.47, blue: 0.49)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing))
+        let r = ImageRenderer(content: view)
+        r.scale = 2
+        guard let img = r.nsImage, let tiff = img.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
+        try? png.write(to: URL(fileURLWithPath: path))
     }
 
     // MARK: status item
@@ -1712,18 +2002,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var lastTitle = ""
+    /// `▣ 18 ◇10` for one server; `▣ 18 ◇10 │ 4 │ ✕` with several, in config order.
     func updateStatusTitle() {
         guard let item else { return }
-        var t: String
-        switch store.link {
-        case .live, .boot:
-            if let s = store.snap {
-                t = "▣ \(s.gpuRun)"
-                if s.pendingTasks > 0 { t += " ◇\(s.pendingTasks)" }
-            } else { t = "▣ …" }
-        case .auth: t = "▣ ⚠︎"
-        default: t = "▣ ✕"
-        }
+        let t = "▣ " + (huds.isEmpty ? "…" : huds.map(\.store.shortStatus).joined(separator: " │ "))
         guard t != lastTitle else { return }
         lastTitle = t
         item.button?.attributedTitle = NSAttributedString(string: t, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium)])
@@ -1731,30 +2013,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ m: NSMenu) {
         m.removeAllItems()
-        let head = NSMenuItem(title: "\(store.cfg.displayLabel) · \(store.cfg.host)  —  \(store.statusText)", action: nil, keyEquivalent: "")
-        head.isEnabled = false
-        m.addItem(head)
-        m.addItem(.separator())
-        add(m, "Refresh Now", #selector(refreshNow), "r")
-        add(m, panel.isVisible ? "Hide HUD" : "Show HUD", #selector(toggleHUD), "h")
-        add(m, "Compact Mode", #selector(toggleCompact), on: store.compact)
-        m.addItem(.separator())
-        add(m, "Float Above Windows", #selector(setFloat), on: layer == .float)
-        add(m, "Pin to Desktop (behind windows)", #selector(setDesktop), on: layer == .desktop)
-        let op = NSMenuItem(title: "Opacity", action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        for v in [100, 90, 80, 70, 60, 50] {
-            let it = NSMenuItem(title: "\(v)%", action: #selector(setOpacity(_:)), keyEquivalent: "")
-            it.target = self
-            it.tag = v
-            it.state = abs(panel.alphaValue * 100 - CGFloat(v)) < 1 ? .on : .off
-            sub.addItem(it)
+        if huds.count == 1, let h = huds.first {
+            let head = NSMenuItem(title: h.menuTitle, action: nil, keyEquivalent: "")
+            head.isEnabled = false
+            m.addItem(head)
+            m.addItem(.separator())
+            h.addItems(to: m, shortcuts: true)
+        } else {
+            for h in huds {
+                let it = NSMenuItem(title: h.menuTitle, action: nil, keyEquivalent: "")
+                let sub = NSMenu()
+                h.addItems(to: sub, shortcuts: false)
+                it.submenu = sub
+                m.addItem(it)
+            }
+            m.addItem(.separator())
+            add(m, "Refresh All", #selector(refreshAll), "r")
+            add(m, huds.contains { $0.panel.isVisible } ? "Hide All HUDs" : "Show All HUDs", #selector(toggleAll), "h")
+            m.addItem(.separator())
         }
-        op.submenu = sub
-        m.addItem(op)
-        add(m, "Click-Through (lock in place)", #selector(toggleClickThrough), on: panel.ignoresMouseEvents)
-        m.addItem(.separator())
-        add(m, "Reconnect SSH (MFA)…", #selector(reconnect))
         add(m, "Edit Config…", #selector(editConfig))
         add(m, "Reload Config", #selector(reloadConfig))
         let login = SMAppService.mainApp.status
@@ -1774,27 +2051,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return it
     }
 
-    @objc func refreshNow() { store.refresh() }
-    @objc func toggleCompact() { store.toggleCompact() }
-    @objc func setFloat() { if layer != .float { toggleLayer() } }
-    @objc func setDesktop() { if layer != .desktop { toggleLayer() } }
-    @objc func reconnect() { store.reconnect() }
-    @objc func reloadConfig() { store.reloadConfig() }
+    @objc func refreshAll() { huds.forEach { $0.store.refresh() } }
+    @objc func toggleAll() {
+        let show = !huds.contains { $0.panel.isVisible }
+        for h in huds where h.panel.isVisible != show { h.toggleHUD() }
+    }
+    @MainActor @objc func reloadConfig() {
+        DirectGate.reset()   // the user may have fixed the login; each target gets one direct try again
+        sync(Config.loadAll())
+    }
     @objc func editConfig() {
         if !FileManager.default.fileExists(atPath: Config.file.path) { Config().save() }
         NSWorkspace.shared.open(Config.file)
-    }
-    @objc func toggleHUD() {
-        if panel.isVisible { panel.orderOut(nil) } else { panel.orderFrontRegardless() }
-        defaults.set(!panel.isVisible, forKey: "hud.hidden")
-    }
-    @objc func setOpacity(_ sender: NSMenuItem) {
-        panel.alphaValue = CGFloat(sender.tag) / 100
-        defaults.set(Double(sender.tag) / 100, forKey: "hud.alpha")
-    }
-    @objc func toggleClickThrough() {
-        panel.ignoresMouseEvents.toggle()
-        defaults.set(panel.ignoresMouseEvents, forKey: "hud.clickThrough")
     }
     @objc func toggleLogin() {
         let svc = SMAppService.mainApp
