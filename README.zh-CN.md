@@ -1,14 +1,19 @@
 # SlurmHUD
 
+[English](README.md) · 中文
+
 一个原生的 macOS 桌面小看板，用来盯 Slurm 作业。它可以放在桌面上，也可以悬浮在所有窗口之上，显示你正在用几张卡、哪些作业在排队以及原因，也会显示你的 fair-share LevelFS 和集群剩余的空闲卡。
 
-[English](README.md)
-
-![SlurmHUD 显示正在运行和排队的作业、fair-share 与集群余量](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" width="380" alt="深色模式下的 SlurmHUD：正在运行和排队的作业、fair-share 与集群余量">
+  <img src="docs/screenshot-light.png" width="380" alt="浅色模式下的同一个面板">
+</p>
 
 - **轻量**：一个 Swift 文件，AppKit + SwiftUI，没有 Electron，也没有 WebView。内存约 35 MB，空闲时 CPU 接近 0。
 - **每次刷新只走一次 ssh**：默认 60 秒一次，返回约 11 KB 数据，集群上什么都不用装。
 - **对 MFA 登录节点安全**：复用你的 SSH ControlMaster 连接。一次登录失败之后就不会再自己去认证，所以笔记本睡眠醒来也不会把你的 IP 弄进封禁名单。
+- **一眼看清**：同一组 sweep、同一批 seed 自动合并成一行，八个作业读起来就是三个实验。
+- **安静**：低饱和度配色，跟随系统的浅色 / 深色外观。
 
 ## 显示内容
 
@@ -16,7 +21,7 @@
 |---|---|
 | GPU ACTIVE / QUEUED | 你的 running 作业占用、pending 作业申请的 GPU 数。每张卡一个方块，按型号着色，虚线框表示排队中。旁边的小折线图记录最近几小时的变化。 |
 | FAIRSHARE | 你所在 account 相对其他 account 的 LevelFS、你在组内的 LevelFS，以及 FairShare 因子（都来自 `sshare`）。 |
-| RUNNING | 每个作业的 GPU 型号 × 数量、已运行时间 / 时限，以及进度条，超过 90% 变成琥珀色。 |
+| RUNNING | 每个作业（或[一组相似作业](#作业分组)）的 GPU 型号 × 数量、已运行时间 / 时限，以及进度条，超过 90% 会变色。 |
 | QUEUE | 排队原因（PRIORITY、RESOURCES、QOS LIMIT 等）和 Slurm 估计的开始时间。合并显示的数组作业按任务数计数。 |
 | CLUSTER | 每种卡的空闲数 / 总数，只统计能接新作业的节点（down、draining、不响应的节点不算）。 |
 | LAST 12H | 最近 12 小时完成、失败、超时、取消的作业数，以及最近失败的几个作业。 |
@@ -59,13 +64,26 @@ cd slurm-hud
 | `historyHours` | `12` | 历史统计的时间窗口，1–336 小时 |
 | `showCluster`、`showHistory` | `true` | 关掉后，集群上对应的查询也不再执行 |
 | `extraSSHOptions` | `[]` | 每次 ssh 调用都会带上的额外参数，例如 `["-o", "Port=2222"]` |
-| `groupJobs` | `true` | 名字只差数字或末尾单字母的作业自动合并成一行（`eval_s0`、`eval_s1` → `eval_s* ×2`） |
-| `groupRules` | `[]` | 自定义分组，优先于自动规则：`[{"match": "^llama", "label": "LLM finetunes"}]`。`match` 是匹配作业名的正则，`label` 可省略 |
-
-合并后的一行会显示作业数、整组的 GPU 数、每个作业一条细进度条，以及最接近时限的那个作业的时间。
-悬停可看每个作业的明细，右键可复制全部作业 ID。HUD 会跟随系统的浅色 / 深色外观。
+| `groupJobs` | `true` | 相似的作业合并成一行，见[作业分组](#作业分组) |
+| `groupRules` | `[]` | 自定义分组，优先于自动规则 |
 
 改完后在菜单栏图标里点 **Reload Config**。
+
+### 作业分组
+
+属于同一组的作业在 RUNNING 和 QUEUE 里各占一行：
+
+- **自动规则**：名字只差数字或末尾单个字母的作业会合并，例如 `eval_s0`、`eval_s1` → `eval_s* ×2`，`ablate_a`、`ablate_b` → `ablate_* ×2`。同一个数组作业的任务也会合并。
+- **自定义规则**：`match` 是在作业名里搜索的正则，按顺序匹配，先命中的生效。`label` 可省略，默认取这些名字的公共部分。
+
+```json
+"groupRules": [
+  { "match": "^(llama|qwen)", "label": "LLM finetunes" },
+  { "match": "eval" }
+]
+```
+
+合并后的一行显示作业数、整组的 GPU 数，以及每个作业一条细进度条。时间取最接近时限的那个作业，排队的组取最早的预计开始时间。悬停可看每个作业的明细，右键可复制全部作业 ID。想让每个作业单独占一行，设 `"groupJobs": false`。
 
 ## SSH 设置与 MFA 集群
 
@@ -91,7 +109,7 @@ Host mycluster
 ## 使用
 
 - 拖动面板任意位置可以移动。点 **▴ / ▾** 切换成一行的精简模式。
-- 右键作业可以复制作业 ID、作业名或者 `scancel` 命令。
+- 鼠标悬停在一行上可以看到作业 ID、分区和节点。右键可以复制作业 ID、作业名或者 `scancel` 命令。
 - 默认钉在桌面上，位于所有窗口下面，效果像桌面小组件。用 Fn+F11、⌘F3 或触控板张开手势回到桌面就能看到。想让它一直在最上层，就在菜单里选 **Float Above Windows**。
 - 菜单栏图标里还有显示/隐藏、透明度、点击穿透、重连、编辑/重载配置和开机启动。
 
@@ -114,7 +132,7 @@ Tests/run.sh            # 解析器回归测试
 ```bash
 B=~/Applications/SlurmHUD.app/Contents/MacOS/SlurmHUD
 $B --parse Tests/edge_cases.txt                     # 打印解析器对一段探测输出的解析结果
-$B --demo docs/demo_probe.txt --render /tmp/hud.png # 用虚构数据渲染 HUD 的 PNG
+$B --demo docs/demo_probe.txt --render /tmp/hud.png # 用虚构数据渲染 HUD 的 PNG（可加 --light 或 --dark）
 SLURMHUD_CONFIG_DIR=/tmp/t1 $B                      # 使用单独的配置目录
 ```
 

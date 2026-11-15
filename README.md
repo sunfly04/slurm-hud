@@ -1,16 +1,21 @@
 # SlurmHUD
 
+English · [中文](README.zh-CN.md)
+
 A small native macOS HUD for your Slurm jobs. It sits on your desktop (or floats above your windows) and shows
 how many GPUs you are using, what is queued and why, your fair-share LevelFS, and how many GPUs the cluster has free.
 
-[中文说明](README.zh-CN.md)
-
-![SlurmHUD showing running and queued jobs, fair-share and cluster capacity](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" width="380" alt="SlurmHUD in dark mode: running and queued jobs, fair-share and cluster capacity">
+  <img src="docs/screenshot-light.png" width="380" alt="The same HUD in light mode">
+</p>
 
 - **Light.** AppKit + SwiftUI in a single Swift file. No Electron, no web view. About 35 MB of memory and ~0% CPU when idle.
 - **One ssh call per refresh.** Every 60 s by default, about 11 KB of output. Nothing to install on the cluster.
 - **Safe on MFA login nodes.** It reuses your SSH ControlMaster connection. After one failed login it never tries
   to authenticate again on its own, so a sleeping laptop can't get your IP banned.
+- **Readable at a glance.** Sweeps and seeds fold into one row each, so eight jobs read as three experiments.
+- **Quiet.** A low-saturation palette that follows the system light / dark appearance.
 
 ## What it shows
 
@@ -18,7 +23,7 @@ how many GPUs you are using, what is queued and why, your fair-share LevelFS, an
 |---|---|
 | GPU ACTIVE / QUEUED | GPUs held by your running jobs and requested by pending ones. One block per GPU, colored by type; dashed blocks are queued. A sparkline tracks the last hours. |
 | FAIRSHARE | LevelFS of your account against other accounts, your own LevelFS within the account, and the FairShare factor (all from `sshare`). |
-| RUNNING | Each job with GPU type × count, elapsed / time limit, and a progress bar that turns amber past 90%. |
+| RUNNING | Each job, or [group of similar jobs](#grouping-jobs), with GPU type × count, elapsed / time limit, and a progress bar that changes color past 90%. |
 | QUEUE | Pending reason (PRIORITY, RESOURCES, QOS LIMIT, …) and Slurm's estimated start. Collapsed job arrays are counted per task. |
 | CLUSTER | Free / total GPUs per type, counting only nodes that can take new work (down, draining and unresponsive nodes are excluded). |
 | LAST 12H | Completed, failed, timed-out and cancelled jobs, plus the most recent failures. |
@@ -63,14 +68,30 @@ On first launch the HUD shows **CONFIG ERROR**: click **EDIT**, set `host`, save
 | `historyHours` | `12` | Window for the history line, 1–336 |
 | `showCluster`, `showHistory` | `true` | Turning one off also skips its query on the cluster |
 | `extraSSHOptions` | `[]` | Extra ssh arguments for every call, e.g. `["-o", "Port=2222"]` |
-| `groupJobs` | `true` | Fold jobs whose names differ only by a number or a trailing one-letter token into one row (`eval_s0`, `eval_s1` → `eval_s* ×2`) |
-| `groupRules` | `[]` | Your own groups, checked before the automatic rule: `[{"match": "^llama", "label": "LLM finetunes"}]`. `match` is a regular expression on the job name; `label` is optional |
-
-A grouped row shows the job count, the GPUs of the whole group, one thin progress bar per job, and the time of the
-job closest to its limit. Hover for the per-job list; right-click to copy all job IDs. The HUD follows the system
-light / dark appearance.
+| `groupJobs` | `true` | Show similar jobs as one row, see [Grouping jobs](#grouping-jobs) |
+| `groupRules` | `[]` | Your own groups, checked before the automatic rule |
 
 After editing, choose **Reload Config** from the menu bar item.
+
+### Grouping jobs
+
+Jobs that belong together share one row, in RUNNING and in QUEUE:
+
+- **Automatic.** Names that differ only by a number or a trailing one-letter token are grouped:
+  `eval_s0`, `eval_s1` → `eval_s* ×2`; `ablate_a`, `ablate_b` → `ablate_* ×2`. Tasks of one job array are grouped too.
+- **Your own rules.** `match` is a regular expression searched in the job name; the first matching rule wins.
+  `label` is optional and defaults to the common part of the names.
+
+```json
+"groupRules": [
+  { "match": "^(llama|qwen)", "label": "LLM finetunes" },
+  { "match": "eval" }
+]
+```
+
+A grouped row shows the job count, the GPUs of the whole group and one thin progress bar per job. Its time is that of
+the job closest to its limit; in the queue it is the earliest estimated start. Hover for the per-job list, right-click
+to copy all job IDs. Set `"groupJobs": false` to list every job on its own row.
 
 ## SSH setup and MFA clusters
 
@@ -102,7 +123,7 @@ How it avoids lockouts:
 ## Using it
 
 - Drag anywhere to move it. **▴ / ▾** switches to a one-line compact view.
-- Right-click a job to copy its ID, its name or a `scancel` command.
+- Hover a row for job ID, partition and node. Right-click to copy the ID, the name or a `scancel` command.
 - By default the HUD is pinned to the desktop, behind your windows like a widget. Show the desktop with Fn+F11, ⌘F3
   or a trackpad spread to see it. Choose **Float Above Windows** in the menu to keep it on top instead.
 - The menu bar item also has show/hide, opacity, click-through, reconnect, edit/reload config and Launch at Login.
@@ -129,7 +150,7 @@ The binary has a few flags for working without a cluster:
 ```bash
 B=~/Applications/SlurmHUD.app/Contents/MacOS/SlurmHUD
 $B --parse Tests/edge_cases.txt                     # print what the parser makes of a probe output
-$B --demo docs/demo_probe.txt --render /tmp/hud.png # synthetic data, PNG of the HUD
+$B --demo docs/demo_probe.txt --render /tmp/hud.png # synthetic data, PNG of the HUD (add --light or --dark)
 SLURMHUD_CONFIG_DIR=/tmp/t1 $B                      # isolated config directory
 ```
 
