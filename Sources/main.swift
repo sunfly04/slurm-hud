@@ -1,0 +1,1738 @@
+// SlurmHUD — a tiny floating HUD for watching your Slurm jobs over SSH.
+// Native AppKit + SwiftUI, no web view. Polls one ssh command every N seconds
+// through an existing ControlMaster socket, so MFA clusters work without
+// the app ever trying to authenticate on its own.
+
+import AppKit
+import SwiftUI
+import Combine
+import ServiceManagement
+
+// MARK: - Config
+
+struct Config: Codable, Equatable {
+    var host = ""      // a Host alias from ~/.ssh/config
+    var label = ""     // header title; defaults to the host name
+    var refreshSeconds = 60.0
+    var maxRows = 8
+    var historyHours = 12
+    var showCluster = true
+    var showHistory = true
+    var extraSSHOptions: [String] = []
+
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Config()
+        host = try c.decodeIfPresent(String.self, forKey: .host) ?? d.host
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? d.label
+        refreshSeconds = try c.decodeIfPresent(Double.self, forKey: .refreshSeconds) ?? d.refreshSeconds
+        maxRows = try c.decodeIfPresent(Int.self, forKey: .maxRows) ?? d.maxRows
+        historyHours = try c.decodeIfPresent(Int.self, forKey: .historyHours) ?? d.historyHours
+        showCluster = try c.decodeIfPresent(Bool.self, forKey: .showCluster) ?? d.showCluster
+        showHistory = try c.decodeIfPresent(Bool.self, forKey: .showHistory) ?? d.showHistory
+        extraSSHOptions = try c.decodeIfPresent([String].self, forKey: .extraSSHOptions) ?? d.extraSSHOptions
+    }
+
+    /// Keep numbers in sane ranges so no view or query can be fed nonsense.
+    mutating func clamp() {
+        refreshSeconds = refreshSeconds.isFinite ? min(max(refreshSeconds, 10), 3600) : 60
+        maxRows = min(max(maxRows, 1), 50)
+        historyHours = min(max(historyHours, 1), 24 * 14)
+    }
+
+    /// A host that ssh could read as an option (or that isn't a single word) is refused outright.
+    var displayLabel: String { label.isEmpty ? (host.isEmpty ? "SLURM" : host).uppercased() : label }
+
+    var problem: String? {
+        if host.isEmpty { return "config: set \"host\" to a Host alias from ~/.ssh/config, then Reload" }
+        if host.hasPrefix("-") { return "config: host must not start with '-'" }
+        if host.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }) {
+            return "config: host must not contain spaces or control characters"
+        }
+        return nil
+    }
+
+    static var dir: URL {
+        if let p = ProcessInfo.processInfo.environment["SLURMHUD_CONFIG_DIR"], !p.isEmpty {
+            return URL(fileURLWithPath: (p as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/slurm-hud", isDirectory: true)
+    }
+    static var file: URL { dir.appendingPathComponent("config.json") }
+
+    /// Returns the config plus a message when it can't be used. A broken file is never overwritten.
+    static func load() -> (Config, String?) {
+        guard let data = try? Data(contentsOf: file) else {
+            let c = Config()
+            c.save()
+            return (c, nil)
+        }
+        do {
+            var c = try JSONDecoder().decode(Config.self, from: data)
+            c.clamp()
+            return (c, c.problem)
+        } catch {
+            return (Config(), "config: config.json is not valid JSON")
+        }
+    }
+
+    func save() {
+        try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+        let e = JSONEncoder()
+        e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? e.encode(self).write(to: Config.file)
+    }
+}
+
+// MARK: - Model
+
+struct Job: Identifiable, Equatable {
+    let id: String              // JobArrayID: 123, 123_4, or a collapsed pending array like 123_[0-9%2]
+    let partition: String
+    let name: String
+    let st: String              // compact state: R, PD, CG, ...
+    let elapsed: Int
+    let limit: Int?
+    let nodes: Int
+    let tasks: Int              // > 1 only for a collapsed pending array
+    let gpuByType: [String: Int] // per task
+    let place: String           // node list when running, reason when pending
+    let start: Date?            // actual start, or Slurm's estimate when pending
+
+    var gpus: Int { gpuByType.values.reduce(0, +) * tasks }
+    var isRunning: Bool { st == "R" || st == "CG" || st == "CF" }
+    var isPending: Bool { st == "PD" }
+}
+
+struct ShareRow: Equatable { let account: String; let fairShare: Double?; let levelFS: Double? }
+struct Pool: Identifiable, Equatable { let id: String; var total = 0; var used = 0; var free = 0 }
+struct Failure: Identifiable, Equatable { let id: String; let name: String; let state: String }
+struct Hist: Equatable { var ok = 0, fail = 0, timeout = 0, cancel = 0; var failures: [Failure] = [] }
+struct TypeCount: Identifiable, Equatable { let id: String; let n: Int }
+struct Sample: Equatable { let t: Date; let v: Int }
+
+struct Snapshot: Equatable {
+    var node = "", user = ""
+    var jobs: [Job] = []
+    var shares: [ShareRow] = []
+    var acctLFS: [String: Double] = [:]
+    var pools: [Pool] = []
+    var hist = Hist()
+    var serverNow = Date()
+    var fetched = Date()
+    var unavailable: Set<String> = []   // sections whose query failed this round and had nothing to fall back on
+    var stale: Set<String> = []         // sections carried over from an earlier round because the query failed
+
+    var running: [Job] { jobs.filter(\.isRunning) }
+    var pending: [Job] {
+        jobs.filter(\.isPending).sorted { ($0.start ?? .distantFuture, $0.id) < ($1.start ?? .distantFuture, $1.id) }
+    }
+    var gpuRun: Int { running.reduce(0) { $0 + $1.gpus } }
+    var gpuPend: Int { pending.reduce(0) { $0 + $1.gpus } }
+    var pendingTasks: Int { pending.reduce(0) { $0 + $1.tasks } }
+
+    static func group(_ js: [Job]) -> [TypeCount] {
+        var d: [String: Int] = [:]
+        for j in js { for (t, n) in j.gpuByType where n > 0 { d[t, default: 0] += n * j.tasks } }
+        return d.map { TypeCount(id: $0.key, n: $0.value) }.sorted { $0.n != $1.n ? $0.n > $1.n : $0.id < $1.id }
+    }
+}
+
+// MARK: - Remote probe (one ssh round trip)
+
+enum Remote {
+    // Every section reports failure as "@@NA <SECTION>" instead of pretending to be empty.
+    // `sq` strips the column padding of -O output (~150 KB -> ~11 KB per round on a ~200-node cluster).
+    // Names go in the last column so a '|' inside a name can be re-joined by the parser.
+    static let script = #"""
+    H=__HOURS__; WANT_NODES=__NODES__; WANT_HIST=__HIST__
+    export SLURM_TIME_FORMAT=%s
+    sq() { sed -E 's/ +\|/|/g'; }
+    command -v squeue >/dev/null 2>&1 || { echo "@@ERR slurm commands not found in PATH"; exit 0; }
+    echo "@@HOST $(hostname -s)|$USER"
+    echo "@@NOW $(date +%s)"
+    echo "@@ENV ${SLURM_CONF:-}|$(dirname "$(command -v squeue)")"
+    J=$(squeue -u "$USER" -h -O "JobArrayID:60|,Partition:120|,StateCompact:8|,TimeUsed:20|,TimeLimit:20|,NumNodes:8|,tres-alloc:300|,ReasonList:300|,StartTime:24|,tres-per-node:120|,Name:300|" 2>&1) || { echo "@@ERR $(printf '%s' "$J" | tail -n 1)"; exit 0; }
+    echo "@@JOBS"
+    [ -n "$J" ] && printf '%s\n' "$J" | sq
+    if U=$(sshare -nP -U -u "$USER" -o Account,User,FairShare,LevelFS 2>/dev/null); then
+      echo "@@SHARE"
+      [ -n "$U" ] && printf '%s\n' "$U"
+      A=$(printf '%s\n' "$U" | cut -d'|' -f1 | sed 's/^ *//' | grep -v '^$' | sort -u | paste -sd, -)
+      [ -n "$A" ] && sshare -nP -A "$A" -o Account,User,FairShare,LevelFS 2>/dev/null | awk -F'|' '$1 !~ /^ / && $2 == "" {print "ACCT|"$0}'
+    else
+      echo "@@NA SHARE"
+    fi
+    if [ "$WANT_NODES" = 1 ]; then
+      if N=$(sinfo -h -N -O "NodeHost:80|,Gres:300|,GresUsed:300|,StateCompact:20|" 2>/dev/null); then
+        echo "@@NODES"
+        printf '%s\n' "$N" | sq | sort -u
+      else
+        echo "@@NA NODES"
+      fi
+    fi
+    if [ "$WANT_HIST" = 1 ]; then
+      if S=$(sacct -u "$USER" -X -n -P -S "now-${H}hours" -o JobID,State,End,JobName 2>/dev/null); then
+        echo "@@HIST"
+        printf '%s\n' "$S" | awk -F'|' '
+          $2 ~ /^COMPLETED/ {ok++}
+          $2 ~ /^CANCELLED/ {ca++}
+          $2 ~ /^TIMEOUT/ {to++}
+          $2 ~ /^(FAILED|OUT_OF_MEMORY|NODE_FAIL|BOOT_FAIL|PREEMPTED|DEADLINE)/ {fa++}
+          END {printf "COUNT|%d|%d|%d|%d\n", ok, fa, to, ca}'
+        printf '%s\n' "$S" | awk -F'|' '$2 ~ /^(FAILED|OUT_OF_MEMORY|NODE_FAIL|BOOT_FAIL|PREEMPTED|DEADLINE|TIMEOUT)/ {print "FAIL|"$0}' \
+          | sort -t'|' -k4,4nr | head -n 3
+      else
+        echo "@@NA HIST"
+      fi
+    fi
+    echo "@@END"
+    """#
+
+    static func render(_ c: Config) -> String {
+        script
+            .replacingOccurrences(of: "__HOURS__", with: String(c.historyHours))
+            .replacingOccurrences(of: "__NODES__", with: c.showCluster ? "1" : "0")
+            .replacingOccurrences(of: "__HIST__", with: c.showHistory ? "1" : "0")
+    }
+}
+
+// MARK: - Formatting
+
+enum Fmt {
+    static func dur(_ raw: String) -> Int? {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        guard let first = s.first, first.isNumber else { return nil }   // UNLIMITED, INVALID, N/A
+        var days = 0
+        var rest = Substring(s)
+        if let dash = s.firstIndex(of: "-") {
+            days = Int(s[..<dash]) ?? 0
+            rest = s[s.index(after: dash)...]
+        }
+        let p = rest.split(separator: ":").compactMap { Int($0) }
+        let secs: Int
+        switch p.count {
+        case 3: secs = p[0] * 3600 + p[1] * 60 + p[2]
+        case 2: secs = days > 0 ? p[0] * 3600 + p[1] * 60 : p[0] * 60 + p[1]
+        case 1: secs = days > 0 ? p[0] * 3600 : p[0] * 60
+        default: return nil
+        }
+        return days * 86400 + secs
+    }
+
+    static func hm(_ s: Int?) -> String {
+        guard let s else { return "∞" }
+        if s >= 86400 {
+            let d = s / 86400, h = (s % 86400) / 3600
+            return h == 0 ? "\(d)d" : "\(d)d\(h)h"
+        }
+        return String(format: "%d:%02d", s / 3600, (s % 3600) / 60)
+    }
+
+    static func eta(_ d: Date?, now: Date) -> String {
+        guard let d else { return "—" }
+        let s = Int(d.timeIntervalSince(now))
+        if s <= 60 { return "soon" }
+        if s < 3600 { return "~\(s / 60)m" }
+        if s < 86400 { return "~\(s / 3600)h" }
+        return "~\(s / 86400)d\((s % 86400) / 3600)h"
+    }
+
+    static func num(_ v: Double?) -> String {
+        guard let v else { return "—" }
+        if v.isInfinite { return "∞" }
+        if v >= 1000 { return String(format: "%.0f", v) }
+        return String(format: "%.3f", v)
+    }
+
+    private static let clockFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
+    static func clock(_ d: Date) -> String { clockFmt.string(from: d) }
+
+    static func reason(_ r: String) -> String {
+        let x = r.trimmingCharacters(in: CharacterSet(charactersIn: "() "))
+        let map: [(String, String)] = [
+            ("Priority", "PRIORITY"), ("Resources", "RESOURCES"), ("DependencyNeverSatisfied", "DEP FAIL"),
+            ("Dependency", "DEPEND"), ("ReqNodeNotAvail", "NODE N/A"), ("Nodes required", "NODES DOWN"),
+            ("QOSMax", "QOS LIMIT"), ("QOSGrp", "QOS LIMIT"), ("AssocGrp", "GRP LIMIT"), ("AssocMax", "ACCT LIMIT"),
+            ("BeginTime", "BEGIN"), ("JobHeld", "HELD"), ("Reservation", "RESV"), ("PartitionTimeLimit", "TIME LIMIT"),
+            ("launch failed", "LAUNCH FAIL"), ("BadConstraints", "BAD CONSTR"),
+        ]
+        for (k, v) in map where x.hasPrefix(k) { return v }
+        return String(x.uppercased().prefix(10))
+    }
+}
+
+// MARK: - Parsing
+
+enum Parser {
+    struct Out { var err: String?; var env: String?; var snap: Snapshot? }
+
+    /// `gpu:[type:]count`, where type may start with a digit (e.g. gpu:2060:8) and count must end the token.
+    static let gpuRE = try! NSRegularExpression(pattern: #"gpu:(?:([^:,()\s=|]+):)?(\d+)(?=$|[,()\s|])"#)
+
+    static func gpuMatches<S: StringProtocol>(_ s: S) -> [(String, Int)] {
+        let str = String(s)
+        let ns = str as NSString
+        return gpuRE.matches(in: str, range: NSRange(location: 0, length: ns.length)).map { m in
+            let t = m.range(at: 1).location != NSNotFound ? ns.substring(with: m.range(at: 1)) : "gpu"
+            return (t.lowercased(), Int(ns.substring(with: m.range(at: 2))) ?? 0)
+        }
+    }
+
+    static func fields<S: StringProtocol>(_ line: S) -> [String] {
+        line.split(separator: "|", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Number of tasks in a collapsed array id like `123_[0-9%2]`, `123_[1,3,5-7]`, `123_[0-99:2]`.
+    static func arrayTasks(_ id: String) -> Int {
+        guard let open = id.firstIndex(of: "["), let close = id.lastIndex(of: "]"), open < close else { return 1 }
+        var spec = id[id.index(after: open)..<close]
+        if let pct = spec.firstIndex(of: "%") { spec = spec[..<pct] }
+        var n = 0
+        for part in spec.split(separator: ",") {
+            let stepParts = part.split(separator: ":")
+            let step = stepParts.count > 1 ? max(1, Int(stepParts[1]) ?? 1) : 1
+            let r = stepParts.first?.split(separator: "-") ?? []
+            if r.count == 2, let a = Int(r[0]), let b = Int(r[1]), b >= a {
+                n += (b - a) / step + 1
+            } else if r.count == 1, Int(r[0]) != nil {
+                n += 1
+            }
+        }
+        return max(1, n)
+    }
+
+    static func parse(_ text: String) -> Out {
+        var out = Out()
+        var s = Snapshot()
+        var sec = ""
+        var ended = false
+        var jobL: [Substring] = [], shareL: [Substring] = [], nodeL: [Substring] = [], histL: [Substring] = []
+
+        for line in text.split(separator: "\n") {
+            if line.hasPrefix("@@") {
+                let body = line.dropFirst(2)
+                let tag = String(body.prefix { $0 != " " })
+                let rest = body.dropFirst(tag.count).trimmingCharacters(in: .whitespaces)
+                switch tag {
+                case "ERR":
+                    out.err = rest.isEmpty ? "remote error" : rest
+                    return out
+                case "HOST":
+                    let f = rest.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+                    s.node = f.first ?? ""
+                    s.user = f.count > 1 ? f[1] : ""
+                case "NOW":
+                    if let e = Double(rest.split(separator: " ").first ?? "") { s.serverNow = Date(timeIntervalSince1970: e) }
+                case "ENV":
+                    out.env = rest
+                case "NA":
+                    s.unavailable.insert(rest)
+                    sec = ""
+                case "END":
+                    ended = true
+                    sec = ""
+                default:
+                    sec = tag
+                }
+                continue
+            }
+            switch sec {
+            case "JOBS": jobL.append(line)
+            case "SHARE": shareL.append(line)
+            case "NODES": nodeL.append(line)
+            case "HIST": histL.append(line)
+            default: break   // login banners etc.
+            }
+        }
+        guard ended else { out.err = "incomplete response from server"; return out }
+
+        s.jobs = jobL.compactMap(job)
+
+        for l in shareL {
+            let f = fields(l)
+            if f.first == "ACCT" {
+                if f.count >= 5 { s.acctLFS[f[1]] = Double(f[4]) }
+            } else if f.count >= 4, !f[1].isEmpty {
+                s.shares.append(ShareRow(account: f[0], fairShare: Double(f[2]), levelFS: Double(f[3])))
+            }
+        }
+
+        s.pools = pools(nodeL)
+        s.hist = hist(histL)
+        out.snap = s
+        return out
+    }
+
+    static func job(_ line: Substring) -> Job? {
+        var f = fields(line)
+        if f.last == "" { f.removeLast() }      // trailing column suffix
+        guard f.count >= 11, let c = f[0].first, c.isNumber else { return nil }
+        let nodes = max(1, Int(f[5]) ?? 1)
+
+        var byType: [String: Int] = [:]
+        var total = 0
+        for kv in f[6].split(separator: ",") {
+            if kv.hasPrefix("gres/gpu=") {
+                total = Int(kv.dropFirst(9)) ?? 0
+            } else if kv.hasPrefix("gres/gpu:"), let eq = kv.firstIndex(of: "=") {
+                let t = String(kv[kv.index(kv.startIndex, offsetBy: 9)..<eq]).lowercased()
+                let n = Int(kv[kv.index(after: eq)...]) ?? 0
+                if n > 0 { byType[t, default: 0] += n }
+            }
+        }
+        let perNode = gpuMatches(f[9]).filter { $0.1 > 0 }
+        if total == 0 && byType.isEmpty {
+            for (t, n) in perNode { byType[t, default: 0] += n * nodes }
+        } else if byType.isEmpty {
+            let named = perNode.count == 1 && perNode[0].0 != "gpu" ? perNode[0].0 : "gpu"
+            byType[named] = total
+        } else {
+            let typed = byType.values.reduce(0, +)
+            if total > typed { byType["gpu", default: 0] += total - typed }
+        }
+
+        let start = Double(f[8]).flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
+        return Job(id: f[0], partition: f[1], name: f[10...].joined(separator: "|"), st: f[2],
+                   elapsed: Fmt.dur(f[3]) ?? 0, limit: Fmt.dur(f[4]), nodes: nodes,
+                   tasks: arrayTasks(f[0]), gpuByType: byType,
+                   place: f[7].trimmingCharacters(in: CharacterSet(charactersIn: "()")),
+                   start: start)
+    }
+
+    /// Free GPUs count only on nodes the scheduler can place new work on.
+    static func pools(_ lines: [Substring]) -> [Pool] {
+        let usableBase: Set<String> = ["idle", "mix", "alloc", "comp", "plnd"]
+        let blockingFlags = Set("*$@^%!")   // not responding, maint, reboot pending/issued, powering down
+        var pools: [String: Pool] = [:]
+        var seen = Set<String>()
+        for l in lines {
+            let f = fields(l)
+            guard f.count >= 4, !f[0].isEmpty, seen.insert(f[0]).inserted else { continue }
+            let raw = f[3].lowercased()
+            let base = String(raw.prefix { $0.isLetter })
+            let usable = usableBase.contains(base) && !raw.contains(where: blockingFlags.contains)
+            let used = Dictionary(gpuMatches(f[2]), uniquingKeysWith: +)
+            for (t, n) in gpuMatches(f[1]) where n > 0 {
+                var p = pools[t] ?? Pool(id: t)
+                let u = min(used[t] ?? 0, n)
+                p.total += n
+                p.used += u
+                if usable { p.free += n - u }
+                pools[t] = p
+            }
+        }
+        return pools.values.sorted { $0.id < $1.id }
+    }
+
+    static func hist(_ lines: [Substring]) -> Hist {
+        var h = Hist()
+        var seen = Set<String>()
+        for l in lines {
+            let f = fields(l)
+            if f.first == "COUNT", f.count >= 5 {
+                h.ok = Int(f[1]) ?? 0; h.fail = Int(f[2]) ?? 0; h.timeout = Int(f[3]) ?? 0; h.cancel = Int(f[4]) ?? 0
+            } else if f.first == "FAIL", f.count >= 5, seen.insert(f[1]).inserted {
+                let st = f[2].uppercased()
+                let short = st.hasPrefix("OUT_OF") ? "OOM" : String(st.split(separator: " ").first ?? "")
+                h.failures.append(Failure(id: f[1], name: f[4...].joined(separator: "|"), state: short))
+            }
+        }
+        return h
+    }
+
+    /// Deterministic text dump, used by `SlurmHUD --parse <file>` and Tests/run.sh.
+    static func describe(_ o: Out) -> String {
+        var r: [String] = []
+        if let e = o.err { r.append("err: \(e)") }
+        guard let s = o.snap else { return r.joined(separator: "\n") }
+        r.append("host: \(s.node)|\(s.user)")
+        for j in s.jobs.sorted(by: { $0.id < $1.id }) {
+            let types = j.gpuByType.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",")
+            r.append("job \(j.id) st=\(j.st) tasks=\(j.tasks) gpus=\(j.gpus) types=[\(types)] start=\(j.start.map { String(Int($0.timeIntervalSince1970)) } ?? "-") name=\(j.name)")
+        }
+        for x in s.shares { r.append("share \(x.account) fs=\(Fmt.num(x.fairShare)) lfs=\(Fmt.num(x.levelFS))") }
+        for (k, v) in s.acctLFS.sorted(by: { $0.key < $1.key }) { r.append("acct \(k) lfs=\(Fmt.num(v))") }
+        for p in s.pools { r.append("pool \(p.id) total=\(p.total) used=\(p.used) free=\(p.free)") }
+        r.append("hist ok=\(s.hist.ok) fail=\(s.hist.fail) timeout=\(s.hist.timeout) cancel=\(s.hist.cancel)")
+        for f in s.hist.failures { r.append("failure \(f.id) \(f.state) \(f.name)") }
+        r.append("unavailable: \(s.unavailable.sorted().joined(separator: ","))")
+        r.append("totals gpuRun=\(s.gpuRun) gpuPend=\(s.gpuPend) pendingTasks=\(s.pendingTasks)")
+        return r.joined(separator: "\n")
+    }
+}
+
+// MARK: - SSH
+
+func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+enum SSH {
+    struct Result { var status: Int32 = -1; var out = ""; var err = ""; var timedOut = false }
+
+    final class Flag {
+        private let lock = NSLock()
+        private var v = false
+        func set() { lock.lock(); v = true; lock.unlock() }
+        var value: Bool { lock.lock(); defer { lock.unlock() }; return v }
+    }
+
+    static func run(_ args: [String], stdin: String?, timeout: Double) -> Result {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = args
+        let o = Pipe(), e = Pipe(), i = Pipe()
+        p.standardOutput = o
+        p.standardError = e
+        p.standardInput = i
+        var r = Result()
+        do { try p.run() } catch { r.err = error.localizedDescription; return r }
+        if let stdin { try? i.fileHandleForWriting.write(contentsOf: Data(stdin.utf8)) }
+        try? i.fileHandleForWriting.close()
+
+        let timed = Flag()
+        let killer = DispatchWorkItem { if p.isRunning { timed.set(); p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+        var errData = Data()
+        let g = DispatchGroup()
+        g.enter()
+        DispatchQueue.global().async { errData = e.fileHandleForReading.readDataToEndOfFile(); g.leave() }
+        let outData = o.fileHandleForReading.readDataToEndOfFile()
+        g.wait()
+        p.waitUntilExit()
+        killer.cancel()
+
+        r.status = p.terminationStatus
+        r.out = String(decoding: outData, as: UTF8.self)
+        r.err = String(decoding: errData, as: UTF8.self)
+        r.timedOut = timed.value
+        return r
+    }
+
+    /// Fully expanded ControlPath for the host (our own if ~/.ssh/config gives none), or nil if ssh -G fails.
+    /// Passing it expanded keeps the socket path stable even when we override ProxyCommand below.
+    static func controlPath(_ c: Config) -> String? {
+        func query(_ pre: [String]) -> String? {
+            let r = run(pre + c.extraSSHOptions + ["-G", "--", c.host], stdin: nil, timeout: 5)
+            guard r.status == 0 else { return nil }
+            for line in r.out.split(separator: "\n") where line.hasPrefix("controlpath ") { return String(line.dropFirst(12)) }
+            return "none"
+        }
+        guard let cp = query([]) else { return nil }
+        if cp != "none" { return cp }
+        if let own = query(["-o", "ControlPath=~/.ssh/slurmhud-%C"]), own != "none" { return own }
+        return nil
+    }
+
+    /// Transport options shared by every ssh call (fetch, socket check, reconnect).
+    static func base(_ c: Config, _ cp: String?) -> [String] {
+        (cp.map { ["-o", "ControlPath=\($0)"] } ?? []) + c.extraSSHOptions
+    }
+
+    /// masterOnly: the master socket was up a moment ago. ProxyCommand=false makes sure that if it vanished,
+    /// ssh fails locally instead of silently falling back to a direct (MFA) login.
+    static func fetchArgs(_ c: Config, _ cp: String?, masterOnly: Bool) -> [String] {
+        var a = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=no",
+                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR"]
+        if masterOnly { a += ["-o", "ProxyCommand=/usr/bin/false"] }
+        return a + base(c, cp)
+    }
+
+    static func masterUp(_ c: Config, _ cp: String?) -> Bool {
+        guard cp != nil else { return false }
+        return run(["-o", "LogLevel=QUIET"] + base(c, cp) + ["-O", "check", "--", c.host], stdin: nil, timeout: 5).status == 0
+    }
+
+    /// Failures that never reached sshd's auth stage, so retrying cannot trip a login ban.
+    static func isNetworkError(_ e: String) -> Bool {
+        let s = e.lowercased()
+        return ["timed out", "could not resolve", "nodename nor servname", "name or service not known",
+                "network is unreachable", "no route to host", "connection refused"].contains { s.contains($0) }
+    }
+}
+
+// MARK: - Store / poller
+
+final class Store: ObservableObject {
+    enum Link: Equatable { case boot, live, auth, down(String), error(String), config(String) }
+
+    @Published private(set) var snap: Snapshot?
+    @Published private(set) var link: Link = .boot
+    @Published private(set) var syncing = false
+    @Published private(set) var spark: [Sample] = []
+    @Published private(set) var compact = UserDefaults.standard.bool(forKey: "compact")
+    @Published private(set) var cfg: Config
+    private var cfgError: String?
+
+    private var timer: Timer?
+    private var fastUntil = Date.distantPast
+    private var gen = 0                 // bumps on config reload; in-flight results from older generations are dropped
+    private var cp: String?
+    private var cpResolved = false
+    private var directFailed = false    // a direct login reached the server and failed: from now on use the master socket only
+    private var backoff = 30.0          // retry delay for network-level failures of direct attempts
+
+    init() {
+        let (c, e) = Config.load()
+        cfg = c
+        cfgError = e
+    }
+
+    func toggleCompact() {
+        compact.toggle()
+        UserDefaults.standard.set(compact, forKey: "compact")
+    }
+
+    func reloadConfig() {
+        let (c, e) = Config.load()
+        cfg = c
+        cfgError = e
+        gen += 1
+        cp = nil
+        cpResolved = false
+        directFailed = false
+        backoff = 30
+        snap = nil
+        spark = []
+        link = .boot
+        timer?.invalidate()
+        if !syncing { refresh() }   // otherwise the stale in-flight result restarts polling
+    }
+
+    /// `--demo <file>`: show a captured/synthetic probe output instead of talking to a cluster (screenshots, UI work).
+    var demoText: String?
+
+    private func applyDemo(_ text: String) {
+        let p = Parser.parse(text)
+        guard var sn = p.snap else { link = .error(p.err ?? "demo: could not parse"); return }
+        sn.fetched = Date()
+        if spark.isEmpty {   // a plausible last hour so the sparkline isn't blank
+            let now = Date()
+            spark = (0..<60).map { i in
+                let x = Double(i) / 59
+                let v = Double(sn.gpuRun) * (0.45 + 0.55 * x) + 2.5 * sin(Double(i) / 4.5)
+                return Sample(t: now.addingTimeInterval(Double(i - 59) * 60), v: max(0, Int(v.rounded())))
+            }
+            spark[spark.count - 1] = Sample(t: now, v: sn.gpuRun)
+        }
+        snap = sn
+        link = .live
+    }
+
+    func refresh() {
+        guard !syncing else { return }
+        timer?.invalidate()
+        if let d = demoText { applyDemo(d); return }
+        if let e = cfgError { link = .config(e); return }   // wait for Reload Config
+        syncing = true
+        let cfg = self.cfg, myGen = gen, envKey = "remoteEnv." + cfg.host
+        let cached = UserDefaults.standard.string(forKey: envKey)
+        let resolved = cpResolved, knownCP = cp, masterOnlyMode = directFailed
+
+        DispatchQueue.global(qos: .utility).async {
+            let cp = resolved ? knownCP : SSH.controlPath(cfg)
+            let master = SSH.masterUp(cfg, cp)
+            var r: SSH.Result?
+            var parsed: Parser.Out?
+            if master || !masterOnlyMode {
+                var prelude = ""
+                var remote = "bash -l -s"
+                if let c = cached {
+                    let parts = c.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+                    if parts.count == 2 {
+                        if !parts[0].isEmpty { prelude += "export SLURM_CONF=\(shq(parts[0]))\n" }
+                        if !parts[1].isEmpty && parts[1] != "." { prelude += "export PATH=\(shq(parts[1])):\"$PATH\"\n" }
+                        remote = "bash -s"
+                    }
+                }
+                let res = SSH.run(SSH.fetchArgs(cfg, cp, masterOnly: master) + ["--", cfg.host, remote],
+                                  stdin: prelude + Remote.render(cfg), timeout: 30)
+                if res.status == 0 && !res.timedOut { parsed = Parser.parse(res.out) }
+                r = res
+            }
+            DispatchQueue.main.async {
+                guard myGen == self.gen else {   // config changed while we were out
+                    self.syncing = false
+                    self.refresh()
+                    return
+                }
+                self.cp = cp
+                self.cpResolved = true
+                self.finish(r, parsed, usedLogin: cached == nil, viaMaster: master, envKey: envKey)
+            }
+        }
+    }
+
+    private func finish(_ r: SSH.Result?, _ p: Parser.Out?, usedLogin: Bool, viaMaster: Bool, envKey: String) {
+        syncing = false
+        guard let r else {   // no master socket and direct logins are off
+            link = .auth
+            scheduleNext()
+            return
+        }
+        if let p, let err = p.err {
+            if !usedLogin {   // cached env went stale: retry once with a login shell
+                UserDefaults.standard.removeObject(forKey: envKey)
+                refresh()
+                return
+            }
+            link = .error(err)
+        } else if let p, var sn = p.snap {
+            if usedLogin, let env = p.env { UserDefaults.standard.set(env, forKey: envKey) }
+            sn.fetched = Date()
+            if let old = snap { carryOver(from: old, into: &sn) }
+            link = .live
+            backoff = 30
+            addSample(sn.gpuRun)
+            snap = sn
+            fastUntil = .distantPast
+        } else {
+            let msg = r.err.split(separator: "\n").last.map(String.init) ?? ""
+            if r.timedOut {
+                if !viaMaster { directFailed = true }   // it connected but hung: don't knock again
+                link = .down("ssh timed out after 30s")
+            } else if viaMaster {
+                link = .down("ssh link dropped")      // the next round re-checks the socket
+            } else if SSH.isNetworkError(r.err) {
+                backoff = min(backoff * 2, 900)
+                link = .down(msg.isEmpty ? "network unreachable" : msg)
+            } else {
+                directFailed = true
+                let e = r.err.lowercased()
+                if e.contains("permission denied") || e.contains("keyboard-interactive") || e.contains("authentication") {
+                    link = .auth
+                } else {
+                    link = .down(msg.isEmpty ? "ssh exited with status \(r.status)" : msg)
+                }
+            }
+        }
+        scheduleNext()
+    }
+
+    /// Keep showing the last good data for a section whose query failed this round, marked stale.
+    private func carryOver(from old: Snapshot, into sn: inout Snapshot) {
+        if sn.unavailable.contains("SHARE"), !old.shares.isEmpty {
+            sn.shares = old.shares; sn.acctLFS = old.acctLFS
+            sn.unavailable.remove("SHARE"); sn.stale.insert("SHARE")
+        }
+        if sn.unavailable.contains("NODES"), !old.pools.isEmpty {
+            sn.pools = old.pools
+            sn.unavailable.remove("NODES"); sn.stale.insert("NODES")
+        }
+        if sn.unavailable.contains("HIST"), !old.unavailable.contains("HIST") {
+            sn.hist = old.hist
+            sn.unavailable.remove("HIST"); sn.stale.insert("HIST")
+        }
+    }
+
+    private func addSample(_ v: Int) {
+        let now = Date()
+        if let last = spark.last, now.timeIntervalSince(last.t) < 10 { spark.removeLast() }   // manual refresh burst
+        spark.append(Sample(t: now, v: v))
+        let cutoff = now.addingTimeInterval(-4 * 3600)
+        spark.removeAll { $0.t < cutoff }
+        if spark.count > 240 { spark.removeFirst(spark.count - 240) }
+    }
+
+    private func scheduleNext() {
+        timer?.invalidate()
+        let fast = Date() < fastUntil
+        let iv: Double
+        switch link {
+        case .live, .boot: iv = cfg.refreshSeconds
+        case .auth: iv = fast ? 3 : 15        // local socket check only, no network
+        case .down: iv = fast ? 4 : backoff
+        case .error: iv = fast ? 4 : 60
+        case .config: return
+        }
+        let t = Timer(timeInterval: iv, repeats: false) { [weak self] _ in self?.refresh() }
+        t.tolerance = iv * 0.2
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func wake() {
+        timer?.invalidate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.refresh() }
+    }
+
+    /// Opens Terminal with a one-shot script that starts a persistent ssh master (you do MFA there once).
+    /// Every value is passed through shq(); nothing from the config reaches the shell unquoted.
+    func reconnect() {
+        guard cfgError == nil else { return }
+        let opts = SSH.base(cfg, cp).map(shq).joined(separator: " ")
+        let h = shq(cfg.host)
+        let body = """
+        #!/bin/zsh
+        clear
+        printf '\\033[36m◢ SLURM-HUD\\033[0m  opening a persistent ssh link to %s\\n' \(h)
+        if ssh \(opts) -O check -- \(h) 2>/dev/null; then
+          printf '\\033[32m✓ link already up\\033[0m\\n'
+        else
+          ssh \(opts) -fN -o ControlMaster=yes -o ControlPersist=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -- \(h) \\
+            && printf '\\033[32m✓ link established. The HUD picks it up within seconds; you can close this window.\\033[0m\\n' \\
+            || printf '\\033[31m✗ connection failed\\033[0m\\n'
+        fi
+
+        """
+        let url = Config.dir.appendingPathComponent("connect.command")
+        try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+        try? body.write(to: url, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        NSWorkspace.shared.open(url)
+        fastUntil = Date().addingTimeInterval(180)
+        if !syncing { scheduleNext() }
+    }
+
+    var statusText: String {
+        switch link {
+        case .boot: return "linking…"
+        case .live: return snap.map { "synced \(Fmt.clock($0.fetched))" } ?? "live"
+        case .auth: return "auth required"
+        case .down(let m): return "down: \(m)"
+        case .error(let m): return "error: \(m)"
+        case .config(let m): return m
+        }
+    }
+
+    var sparkMinutes: Int {
+        guard let a = spark.first, let b = spark.last else { return 0 }
+        return Int(b.t.timeIntervalSince(a.t) / 60)
+    }
+}
+
+// MARK: - Theme
+
+enum T {
+    static let cyan = Color(red: 0.24, green: 0.95, blue: 1.0)
+    static let chrome = Color(red: 0.38, green: 0.76, blue: 0.95)
+    static let green = Color(red: 0.32, green: 1.0, blue: 0.64)
+    static let amber = Color(red: 1.0, green: 0.72, blue: 0.30)
+    static let red = Color(red: 1.0, green: 0.33, blue: 0.45)
+    static let magenta = Color(red: 1.0, green: 0.36, blue: 0.86)
+    static let violet = Color(red: 0.70, green: 0.56, blue: 1.0)
+    static let lime = Color(red: 0.78, green: 1.0, blue: 0.36)
+    static let text = Color.white.opacity(0.92)
+    static let dim = Color.white.opacity(0.50)
+    static let faint = Color.white.opacity(0.24)
+
+    static func mono(_ size: CGFloat, _ w: Font.Weight = .regular) -> Font { .system(size: size, weight: w, design: .monospaced) }
+
+    static func gpu(_ type: String) -> Color {
+        let t = type.lowercased()
+        if t.contains("h100") || t.contains("h200") || t.contains("b200") || t.contains("gh200") { return magenta }
+        if t.contains("l40") { return cyan }
+        if t.contains("a100") || t.contains("a40") { return violet }
+        let pal = [lime, amber, violet, cyan]
+        return pal[t.unicodeScalars.reduce(0) { $0 &+ Int($1.value) } % pal.count]
+    }
+
+    static func lfs(_ v: Double?) -> Color {
+        guard let v else { return dim }
+        return v >= 1 ? green : amber
+    }
+}
+
+// MARK: - Views
+
+let hudWidth: CGFloat = 360
+
+struct HUDView: View {
+    @ObservedObject var s: Store
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HeaderView(s: s)
+            if s.link != .live && s.link != .boot { Banner(s: s) }
+            if let snap = s.snap {
+                Group {
+                    if s.compact { CompactView(snap: snap) } else { FullView(snap: snap, s: s) }
+                }
+                .opacity(s.link == .live ? 1 : 0.45)
+            } else if s.link == .boot {
+                Text("ESTABLISHING LINK …").font(T.mono(9.5)).tracking(2).foregroundColor(T.dim)
+            }
+        }
+        .padding(.horizontal, 14).padding(.top, 11).padding(.bottom, 12)
+        .frame(width: hudWidth, alignment: .leading)
+        .background(Chrome())
+        .contextMenu { RootMenu(s: s) }
+    }
+}
+
+struct RootMenu: View {
+    @ObservedObject var s: Store
+    var body: some View {
+        Button("Refresh Now") { s.refresh() }
+        Button(s.compact ? "Expand" : "Compact") { s.toggleCompact() }
+        Divider()
+        Button(AppDelegate.shared?.layer == .desktop ? "Float Above Windows" : "Pin to Desktop (behind windows)") { AppDelegate.shared?.toggleLayer() }
+        Button("Reconnect SSH…") { s.reconnect() }
+        Divider()
+        Button("Quit SlurmHUD") { NSApp.terminate(nil) }
+    }
+}
+
+struct Chrome: View {
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.03, green: 0.08, blue: 0.12).opacity(0.80),
+                                    Color(red: 0.00, green: 0.02, blue: 0.05).opacity(0.88)],
+                           startPoint: .top, endPoint: .bottom)
+            Canvas { ctx, size in
+                var grid = Path()
+                for x in stride(from: CGFloat(0), through: size.width, by: 24) {
+                    grid.move(to: CGPoint(x: x, y: 0)); grid.addLine(to: CGPoint(x: x, y: size.height))
+                }
+                for y in stride(from: CGFloat(0), through: size.height, by: 24) {
+                    grid.move(to: CGPoint(x: 0, y: y)); grid.addLine(to: CGPoint(x: size.width, y: y))
+                }
+                ctx.stroke(grid, with: .color(T.cyan.opacity(0.045)), lineWidth: 0.5)
+                var scan = Path()
+                for y in stride(from: CGFloat(0), through: size.height, by: 3) {
+                    scan.move(to: CGPoint(x: 0, y: y)); scan.addLine(to: CGPoint(x: size.width, y: y))
+                }
+                ctx.stroke(scan, with: .color(.black.opacity(0.16)), lineWidth: 1)
+            }
+        }
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(T.chrome.opacity(0.26), lineWidth: 1))
+        .overlay(CornerGlints(radius: 12).stroke(T.cyan.opacity(0.95), style: StrokeStyle(lineWidth: 1.6, lineCap: .round)))
+    }
+}
+
+/// Bright arcs + short tails on the four corners of the rounded border.
+struct CornerGlints: Shape {
+    let radius: CGFloat
+    func path(in rect: CGRect) -> Path {
+        let r = rect.insetBy(dx: 0.8, dy: 0.8)
+        let k = radius - 0.8, tail: CGFloat = 12
+        var p = Path()
+        p.move(to: CGPoint(x: r.minX, y: r.minY + k + tail))
+        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.minY), tangent2End: CGPoint(x: r.minX + k, y: r.minY), radius: k)
+        p.addLine(to: CGPoint(x: r.minX + k + tail, y: r.minY))
+        p.move(to: CGPoint(x: r.maxX - k - tail, y: r.minY))
+        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.minY), tangent2End: CGPoint(x: r.maxX, y: r.minY + k), radius: k)
+        p.addLine(to: CGPoint(x: r.maxX, y: r.minY + k + tail))
+        p.move(to: CGPoint(x: r.maxX, y: r.maxY - k - tail))
+        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.maxY), tangent2End: CGPoint(x: r.maxX - k, y: r.maxY), radius: k)
+        p.addLine(to: CGPoint(x: r.maxX - k - tail, y: r.maxY))
+        p.move(to: CGPoint(x: r.minX + k + tail, y: r.maxY))
+        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.maxY), tangent2End: CGPoint(x: r.minX, y: r.maxY - k), radius: k)
+        p.addLine(to: CGPoint(x: r.minX, y: r.maxY - k - tail))
+        return p
+    }
+}
+
+struct HeaderView: View {
+    @ObservedObject var s: Store
+    var body: some View {
+        let (lc, lt): (Color, String) = {
+            if s.syncing && s.link == .live { return (T.cyan, "SYNC") }
+            switch s.link {
+            case .boot: return (T.cyan, "BOOT")
+            case .live: return (T.green, "LIVE")
+            case .auth: return (T.amber, "AUTH")
+            case .down: return (T.red, "DOWN")
+            case .error: return (T.red, "ERR")
+            case .config: return (T.red, "CFG")
+            }
+        }()
+        HStack(spacing: 6) {
+            Text("◢").font(T.mono(9)).foregroundColor(T.cyan).shadow(color: T.cyan, radius: 3)
+            Text(s.cfg.displayLabel.uppercased()).font(T.mono(11.5, .bold)).tracking(2.6).foregroundColor(T.text)
+            Text("// \(s.snap?.node ?? s.cfg.host)").font(T.mono(9.5)).foregroundColor(T.dim).lineLimit(1)
+            Spacer(minLength: 4)
+            Circle().fill(lc).frame(width: 5, height: 5).shadow(color: lc, radius: 3)
+            Text(lt).font(T.mono(9, .bold)).tracking(1.4).foregroundColor(lc)
+            if let t = s.snap?.fetched {
+                Text(Fmt.clock(t)).font(T.mono(9)).foregroundColor(T.dim)
+            }
+            Button(action: { s.toggleCompact() }) {
+                Text(s.compact ? "▾" : "▴").font(T.mono(10)).foregroundColor(T.chrome)
+                    .frame(width: 14, height: 14).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+struct Banner: View {
+    @ObservedObject var s: Store
+    var body: some View {
+        let (title, detail, color): (String, String, Color) = {
+            switch s.link {
+            case .auth: return ("AUTH REQUIRED", "no live ssh link to \(s.cfg.host); log in once (MFA)", T.amber)
+            case .down(let m): return ("LINK DOWN", m, T.red)
+            case .error(let m): return ("SLURM ERROR", m, T.red)
+            case .config(let m): return ("CONFIG ERROR", m, T.red)
+            default: return ("", "", T.dim)
+            }
+        }()
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(T.mono(9.5, .bold)).tracking(1.4).foregroundColor(color)
+                Text(detail).font(T.mono(8.5)).foregroundColor(T.dim).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 4)
+            switch s.link {
+            case .config:
+                Button("EDIT") { AppDelegate.shared?.editConfig() }.buttonStyle(HUDButton(color: color))
+                Button("RELOAD") { s.reloadConfig() }.buttonStyle(HUDButton(color: color))
+            case .error:
+                Button("RETRY") { s.refresh() }.buttonStyle(HUDButton(color: color))
+            default:
+                Button("RECONNECT") { s.reconnect() }.buttonStyle(HUDButton(color: color))
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 4).fill(color.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 4).stroke(color.opacity(0.45), lineWidth: 0.75))
+    }
+}
+
+struct HUDButton: ButtonStyle {
+    var color: Color = T.cyan
+    func makeBody(configuration c: Configuration) -> some View {
+        c.label.font(T.mono(9, .bold)).tracking(1.4).foregroundColor(color)
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 3).fill(color.opacity(c.isPressed ? 0.30 : 0.12)))
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(color.opacity(0.7), lineWidth: 0.75))
+            .contentShape(Rectangle())
+    }
+}
+
+struct SectionHead: View {
+    let title: String
+    var tail: String? = nil
+    var color: Color = T.chrome
+    var warn: String? = nil
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title).font(T.mono(8.5, .semibold)).tracking(1.8).foregroundColor(color)
+            if let tail { Text(tail).font(T.mono(8.5, .bold)).foregroundColor(T.text.opacity(0.8)) }
+            if let warn { Text(warn).font(T.mono(7.5, .bold)).tracking(1.2).foregroundColor(T.amber) }
+            Rectangle()
+                .fill(LinearGradient(colors: [color.opacity(0.55), color.opacity(0)], startPoint: .leading, endPoint: .trailing))
+                .frame(height: 0.75)
+        }
+    }
+}
+
+extension Snapshot {
+    /// "STALE" when showing an older round's data for this section, "N/A" when there is none.
+    func warn(_ section: String) -> String? {
+        if stale.contains(section) { return "STALE" }
+        if unavailable.contains(section) { return "N/A" }
+        return nil
+    }
+}
+
+struct Meter: View {
+    let frac: Double
+    let color: Color
+    var height: CGFloat = 3
+    var ticks = true
+    var body: some View {
+        Canvas { ctx, sz in
+            ctx.fill(Path(CGRect(origin: .zero, size: sz)), with: .color(.white.opacity(0.07)))
+            let w = sz.width * CGFloat(max(0, min(1, frac.isFinite ? frac : 0)))
+            if w > 0 {
+                ctx.fill(Path(CGRect(x: 0, y: 0, width: w, height: sz.height)),
+                         with: .linearGradient(Gradient(colors: [color.opacity(0.35), color]),
+                                               startPoint: .zero, endPoint: CGPoint(x: w, y: 0)))
+            }
+            if ticks {
+                for i in 1..<10 {
+                    ctx.fill(Path(CGRect(x: sz.width * CGFloat(i) / 10, y: 0, width: 0.75, height: sz.height)),
+                             with: .color(.black.opacity(0.6)))
+                }
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+struct Sparkline: View {
+    let values: [Int]
+    let color: Color
+    var body: some View {
+        Canvas { ctx, size in
+            var base = Path()
+            base.move(to: CGPoint(x: 0, y: size.height - 0.5)); base.addLine(to: CGPoint(x: size.width, y: size.height - 0.5))
+            ctx.stroke(base, with: .color(color.opacity(0.25)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
+            guard values.count > 1 else { return }
+            let mx = Double(max(values.max() ?? 1, 1))
+            let step = size.width / CGFloat(values.count - 1)
+            var line = Path()
+            for (i, v) in values.enumerated() {
+                let pt = CGPoint(x: CGFloat(i) * step, y: size.height - 1.5 - CGFloat(Double(v) / mx) * (size.height - 4))
+                if i == 0 { line.move(to: pt) } else { line.addLine(to: pt) }
+            }
+            var fill = line
+            fill.addLine(to: CGPoint(x: size.width, y: size.height)); fill.addLine(to: CGPoint(x: 0, y: size.height)); fill.closeSubpath()
+            ctx.fill(fill, with: .linearGradient(Gradient(colors: [color.opacity(0.32), color.opacity(0)]),
+                                                 startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)))
+            ctx.stroke(line, with: .color(color), lineWidth: 1.1)
+        }
+    }
+}
+
+/// One block per GPU while they fit; past 64 GPUs it switches to a proportional bar so the work stays bounded.
+struct GPUBlocks: View {
+    let run: [TypeCount]
+    let pend: [TypeCount]
+    var body: some View {
+        let groups: [(String, Bool, Int)] = run.map { ($0.id, true, $0.n) } + pend.map { ($0.id, false, $0.n) }
+        let total = groups.reduce(0) { $0 + $1.2 }
+        Canvas { ctx, size in
+            guard total > 0 else { return }
+            if total <= 64 {
+                let gap: CGFloat = 2
+                let w = min(9, (size.width - gap * CGFloat(total - 1)) / CGFloat(total))
+                let cell = { (i: Int) in CGRect(x: CGFloat(i) * (w + gap), y: 1, width: w, height: size.height - 2) }
+                var i = 0
+                for (t, filled, n) in groups {
+                    let c = T.gpu(t)
+                    if filled {
+                        let first = i
+                        ctx.drawLayer { l in
+                            l.addFilter(.shadow(color: c.opacity(0.75), radius: 2.5))
+                            for k in 0..<n { l.fill(Path(roundedRect: cell(first + k), cornerRadius: min(1.5, w / 3)), with: .color(c)) }
+                        }
+                    } else {
+                        for k in 0..<n {
+                            ctx.stroke(Path(roundedRect: cell(i + k).insetBy(dx: 0.5, dy: 0.5), cornerRadius: 1.2),
+                                       with: .color(c.opacity(0.8)), style: StrokeStyle(lineWidth: 1, dash: [2, 1.4]))
+                        }
+                    }
+                    i += n
+                }
+            } else {
+                var x: CGFloat = 0
+                for (t, filled, n) in groups {
+                    let w = size.width * CGFloat(n) / CGFloat(total)
+                    let r = CGRect(x: x, y: 1, width: max(w - 2, 1), height: size.height - 2)
+                    let c = T.gpu(t)
+                    if filled {
+                        ctx.fill(Path(roundedRect: r, cornerRadius: 1.5), with: .color(c))
+                    } else {
+                        ctx.stroke(Path(roundedRect: r.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 1.5),
+                                   with: .color(c.opacity(0.8)), style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
+                    }
+                    x += w
+                }
+            }
+        }
+        .frame(height: 13)
+        .overlay(alignment: .leading) {
+            if total == 0 { Text("· · ·  NO GPU ALLOCATED").font(T.mono(8.5)).tracking(1.2).foregroundColor(T.faint) }
+        }
+    }
+}
+
+struct BigStat: View {
+    let label: String
+    let value: Int
+    let color: Color
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(label).font(T.mono(8, .medium)).tracking(1.6).foregroundColor(T.dim)
+            Text("\(value)").font(T.mono(30, .light)).foregroundColor(color).shadow(color: color.opacity(0.65), radius: 6)
+        }
+    }
+}
+
+struct KV: View {
+    let k: String
+    let v: String
+    let c: Color
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(k).font(T.mono(7.5, .medium)).tracking(1.3).foregroundColor(T.dim)
+            Text(v).font(T.mono(15, .medium)).foregroundColor(c).shadow(color: c.opacity(0.5), radius: 4)
+        }
+    }
+}
+
+struct Chip: View {
+    let j: Job
+    var body: some View {
+        let types = j.gpuByType.filter { $0.value > 0 }
+        let cpu = j.gpus == 0
+        let single = types.count == 1 ? types.keys.first : nil
+        let c = cpu ? T.dim : (single.map(T.gpu) ?? T.chrome)
+        let label = cpu ? "CPU" : "\((single ?? "mix").uppercased())×\(j.gpus)"
+        Text(label).font(T.mono(8.5, .bold)).foregroundColor(c)
+            .padding(.horizontal, 4).padding(.vertical, 1)
+            .background(RoundedRectangle(cornerRadius: 2.5).fill(c.opacity(0.12)))
+            .overlay(RoundedRectangle(cornerRadius: 2.5).stroke(c.opacity(0.5), lineWidth: 0.5))
+            .fixedSize()
+            .help(types.sorted { $0.key < $1.key }.map { "\($0.key.uppercased())×\($0.value * j.tasks)" }.joined(separator: " + "))
+    }
+}
+
+struct JobMenu: View {
+    let j: Job
+    var body: some View {
+        Text("\(j.id) · \(j.partition)")
+        Text(j.place)
+        Divider()
+        Button("Copy Job ID") { copy(j.id) }
+        Button("Copy Job Name") { copy(j.name) }
+        Button("Copy  scancel \(j.id)") { copy("scancel \(j.id)") }
+    }
+    func copy(_ s: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string) }
+}
+
+struct FullView: View {
+    let snap: Snapshot
+    @ObservedObject var s: Store
+    var body: some View {
+        let running = snap.running, pending = snap.pending
+        let rows = s.cfg.maxRows
+        VStack(alignment: .leading, spacing: 11) {
+            GPUSection(snap: snap, spark: s.spark.map(\.v), sparkMinutes: s.sparkMinutes)
+            FairShareSection(snap: snap)
+            if !running.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    SectionHead(title: "RUNNING", tail: "\(running.count)", color: T.green)
+                    ForEach(running.prefix(rows)) { RunRow(j: $0) }
+                    if running.count > rows { More(n: running.count - rows) }
+                }
+            }
+            if !pending.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    SectionHead(title: "QUEUE", tail: "\(snap.pendingTasks)", color: T.amber)
+                    ForEach(pending.prefix(rows)) { QueueRow(j: $0, now: snap.serverNow) }
+                    if pending.count > rows { More(n: pending.count - rows) }
+                }
+            }
+            if running.isEmpty && pending.isEmpty {
+                Text("NO ACTIVE JOBS · GRID IDLE").font(T.mono(9)).tracking(1.6).foregroundColor(T.faint)
+            }
+            if s.cfg.showCluster && (!snap.pools.isEmpty || snap.unavailable.contains("NODES")) {
+                ClusterSection(pools: snap.pools, warn: snap.warn("NODES"))
+            }
+            if s.cfg.showHistory { HistLine(h: snap.hist, hours: s.cfg.historyHours, warn: snap.warn("HIST")) }
+        }
+    }
+}
+
+struct More: View {
+    let n: Int
+    var body: some View { Text("  + \(n) more").font(T.mono(8.5)).foregroundColor(T.faint) }
+}
+
+struct GPUSection: View {
+    let snap: Snapshot
+    let spark: [Int]
+    let sparkMinutes: Int
+    var body: some View {
+        let run = Snapshot.group(snap.running), pend = Snapshot.group(snap.pending)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .bottom, spacing: 20) {
+                BigStat(label: "GPU ACTIVE", value: snap.gpuRun, color: T.cyan)
+                BigStat(label: "GPU QUEUED", value: snap.gpuPend, color: T.amber)
+                Spacer(minLength: 0)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Sparkline(values: spark, color: T.cyan).frame(width: 104, height: 28)
+                    Text(spark.count > 1 ? "ACTIVE · \(max(1, sparkMinutes))M" : "ACTIVE · ——")
+                        .font(T.mono(7)).tracking(1.2).foregroundColor(T.faint)
+                }
+                .padding(.bottom, 4)
+            }
+            GPUBlocks(run: run, pend: pend)
+            if !run.isEmpty || !pend.isEmpty {
+                HStack(spacing: 10) {
+                    ForEach(run) { t in
+                        (Text("■ ").foregroundColor(T.gpu(t.id)) + Text("\(t.id.uppercased()) \(t.n)").foregroundColor(T.text.opacity(0.8)))
+                            .font(T.mono(8.5, .medium))
+                    }
+                    ForEach(pend) { t in
+                        (Text("□ ").foregroundColor(T.gpu(t.id)) + Text("\(t.id.uppercased()) \(t.n)").foregroundColor(T.dim))
+                            .font(T.mono(8.5))
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct FairShareSection: View {
+    let snap: Snapshot
+    var body: some View {
+        let row = snap.shares.first
+        let acct = row.flatMap { snap.acctLFS[$0.account] }
+        VStack(alignment: .leading, spacing: 6) {
+            SectionHead(title: "FAIRSHARE", tail: row?.account, warn: snap.warn("SHARE"))
+            HStack(alignment: .top, spacing: 0) {
+                KV(k: "LEVELFS·GROUP", v: Fmt.num(acct), c: T.lfs(acct)).frame(maxWidth: .infinity, alignment: .leading)
+                KV(k: "LEVELFS·USER", v: Fmt.num(row?.levelFS), c: T.lfs(row?.levelFS)).frame(maxWidth: .infinity, alignment: .leading)
+                KV(k: "FS FACTOR", v: Fmt.num(row?.fairShare), c: T.cyan).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Meter(frac: row?.fairShare ?? 0, color: T.cyan, height: 3)
+        }
+    }
+}
+
+struct RunRow: View {
+    let j: Job
+    var body: some View {
+        let frac = j.limit.map { Double(j.elapsed) / Double(max($0, 1)) } ?? 0
+        VStack(alignment: .leading, spacing: 2.5) {
+            HStack(spacing: 6) {
+                Text("▸").font(T.mono(10, .bold)).foregroundColor(j.st == "R" ? T.green : T.dim)
+                Text(j.name).font(T.mono(10.5)).foregroundColor(T.text).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Chip(j: j)
+                Text("\(Fmt.hm(j.elapsed))/\(Fmt.hm(j.limit))").font(T.mono(9.5)).foregroundColor(T.dim).fixedSize()
+            }
+            Meter(frac: frac, color: frac > 0.9 ? T.amber : T.green, height: 1.5, ticks: false).padding(.leading, 14)
+        }
+        .contentShape(Rectangle())
+        .contextMenu { JobMenu(j: j) }
+        .help("\(j.id) · \(j.partition) · \(j.place)")
+    }
+}
+
+struct QueueRow: View {
+    let j: Job
+    let now: Date
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("◇").font(T.mono(9.5, .bold)).foregroundColor(T.amber)
+            Text(j.name).font(T.mono(10.5)).foregroundColor(T.text.opacity(0.85)).lineLimit(1).truncationMode(.middle)
+            if j.tasks > 1 { Text("×\(j.tasks)").font(T.mono(9, .bold)).foregroundColor(T.amber).fixedSize() }
+            Spacer(minLength: 4)
+            Chip(j: j)
+            Text(Fmt.reason(j.place)).font(T.mono(8, .bold)).foregroundColor(T.amber.opacity(0.9)).fixedSize()
+            Text(Fmt.eta(j.start, now: now)).font(T.mono(9.5)).foregroundColor(T.dim).frame(minWidth: 40, alignment: .trailing).fixedSize()
+        }
+        .contentShape(Rectangle())
+        .contextMenu { JobMenu(j: j) }
+        .help("\(j.id) · \(j.partition) · \(j.place)")
+    }
+}
+
+struct ClusterSection: View {
+    let pools: [Pool]
+    let warn: String?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            SectionHead(title: "CLUSTER", warn: warn)
+            ForEach(pools) { p in
+                HStack(spacing: 8) {
+                    Text(p.id.uppercased()).font(T.mono(9, .semibold)).foregroundColor(T.gpu(p.id)).frame(width: 44, alignment: .leading)
+                    Meter(frac: Double(p.used) / Double(max(p.total, 1)), color: T.gpu(p.id), height: 4)
+                    (Text("\(p.free)").font(T.mono(10, .semibold)).foregroundColor(p.free > 0 ? T.green : T.red)
+                     + Text(" FREE/\(p.total)").font(T.mono(8.5)).foregroundColor(T.dim))
+                        .fixedSize()
+                }
+            }
+        }
+    }
+}
+
+struct HistLine: View {
+    let h: Hist
+    let hours: Int
+    let warn: String?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 12) {
+                Text("LAST \(hours)H").font(T.mono(8.5, .semibold)).tracking(1.6).foregroundColor(T.chrome)
+                if warn == "N/A" {
+                    Text("history unavailable").font(T.mono(9)).foregroundColor(T.faint)
+                } else {
+                    cnt("✓", h.ok, T.green)
+                    cnt("✗", h.fail, T.red)
+                    cnt("⧖", h.timeout, T.amber)
+                    cnt("⊘", h.cancel, T.text.opacity(0.7))
+                }
+                if let warn, warn != "N/A" { Text(warn).font(T.mono(7.5, .bold)).tracking(1.2).foregroundColor(T.amber) }
+                Spacer(minLength: 0)
+            }
+            ForEach(h.failures.prefix(2)) { f in
+                Text("✗ \(f.name) · \(f.state)").font(T.mono(8.5)).foregroundColor(T.red.opacity(0.85)).lineLimit(1).truncationMode(.middle)
+                    .help(f.id)
+            }
+        }
+    }
+    func cnt(_ sym: String, _ n: Int, _ c: Color) -> some View {
+        Text("\(sym) \(n)").font(T.mono(9.5, .medium)).foregroundColor(n > 0 ? c : T.faint)
+    }
+}
+
+struct CompactView: View {
+    let snap: Snapshot
+    var body: some View {
+        let row = snap.shares.first
+        let acct = row.flatMap { snap.acctLFS[$0.account] }
+        HStack(alignment: .center, spacing: 12) {
+            stat("\(snap.gpuRun)", "GPU", T.cyan)
+            bar
+            stat("\(snap.pendingTasks)", "QUEUED", T.amber)
+            bar
+            VStack(alignment: .leading, spacing: 1) {
+                (Text("LFS·G ").foregroundColor(T.dim) + Text(Fmt.num(acct)).foregroundColor(T.lfs(acct))).font(T.mono(9.5, .medium))
+                (Text("LFS·U ").foregroundColor(T.dim) + Text(Fmt.num(row?.levelFS)).foregroundColor(T.lfs(row?.levelFS))).font(T.mono(9.5, .medium))
+            }
+            Spacer(minLength: 0)
+        }
+    }
+    var bar: some View { Rectangle().fill(T.chrome.opacity(0.3)).frame(width: 0.75, height: 22) }
+    func stat(_ v: String, _ k: String, _ c: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(v).font(T.mono(20, .light)).foregroundColor(c).shadow(color: c.opacity(0.6), radius: 5)
+            Text(k).font(T.mono(8, .medium)).tracking(1.2).foregroundColor(T.dim)
+        }
+    }
+}
+
+// MARK: - Window
+
+final class HostView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// Borderless, non-activating panel that never steals keyboard focus; drag anywhere to move.
+final class HUDPanel: NSPanel {
+    var onMoved: (() -> Void)?
+    private var downAt: NSPoint?
+    private var downOrigin = NSPoint.zero
+    private var dragging = false
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    override func sendEvent(_ e: NSEvent) {
+        switch e.type {
+        case .leftMouseDown:
+            downAt = NSEvent.mouseLocation
+            downOrigin = frame.origin
+            dragging = false
+        case .leftMouseDragged:
+            if let d = downAt {
+                let p = NSEvent.mouseLocation
+                let dx = p.x - d.x, dy = p.y - d.y
+                if dragging || abs(dx) + abs(dy) > 3 {
+                    dragging = true
+                    setFrameOrigin(NSPoint(x: downOrigin.x + dx, y: downOrigin.y + dy))
+                    return
+                }
+            }
+        case .leftMouseUp:
+            downAt = nil
+            if dragging { dragging = false; onMoved?(); return }
+        default: break
+        }
+        super.sendEvent(e)
+    }
+}
+
+enum Layer: String { case float, desktop }
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    static weak var shared: AppDelegate?
+    let store = Store()
+    var panel: HUDPanel!
+    var host: HostView<HUDView>!
+    var item: NSStatusItem!
+    var bag = Set<AnyCancellable>()
+    let defaults = UserDefaults.standard
+    var layer: Layer = Layer(rawValue: UserDefaults.standard.string(forKey: "hud.layer") ?? "") ?? .desktop
+    private var layoutQueued = false
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        AppDelegate.shared = self
+        signal(SIGPIPE, SIG_IGN)
+        buildPanel()
+        buildStatusItem()
+        store.objectWillChange
+            .sink { [weak self] _ in self?.scheduleRelayout() }
+            .store(in: &bag)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.store.wake()
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--demo"), i + 1 < CommandLine.arguments.count {
+            store.demoText = (try? String(contentsOfFile: CommandLine.arguments[i + 1], encoding: .utf8)) ?? ""
+        }
+        // Debug: `SlurmHUD --render out.png` writes the HUD to a PNG after each update.
+        // Hooked before the first refresh so synchronous state changes (e.g. a config error) are captured too.
+        if let i = CommandLine.arguments.firstIndex(of: "--render"), i + 1 < CommandLine.arguments.count {
+            let path = CommandLine.arguments[i + 1]
+            store.objectWillChange
+                .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+                .sink { [weak self] _ in self?.renderPNG(path) }
+                .store(in: &bag)
+        }
+        store.refresh()
+    }
+
+    @MainActor func renderPNG(_ path: String) {
+        let view = HUDView(s: store)
+            .padding(24)
+            .background(LinearGradient(colors: [Color(red: 0.16, green: 0.20, blue: 0.30), Color(red: 0.05, green: 0.06, blue: 0.10)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing))
+        let r = ImageRenderer(content: view)
+        r.scale = 2
+        guard let img = r.nsImage, let tiff = img.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
+        try? png.write(to: URL(fileURLWithPath: path))
+    }
+
+    // MARK: panel
+
+    func buildPanel() {
+        let p = HUDPanel(contentRect: initialFrame(height: 120), styleMask: [.borderless, .nonactivatingPanel],
+                         backing: .buffered, defer: false)
+        p.isFloatingPanel = true
+        p.hidesOnDeactivate = false
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = true
+        p.isReleasedWhenClosed = false
+        p.isMovable = false
+        p.animationBehavior = .none
+        p.onMoved = { [weak self] in self?.savePosition() }
+
+        let fx = NSVisualEffectView(frame: NSRect(origin: .zero, size: p.frame.size))
+        fx.material = .hudWindow
+        fx.blendingMode = .behindWindow
+        fx.state = .active
+        fx.maskImage = AppDelegate.roundedMask(12)
+        fx.autoresizingMask = [.width, .height]
+
+        let h = HostView(rootView: HUDView(s: store))
+        h.sizingOptions = [.intrinsicContentSize]
+        h.frame = fx.bounds
+        h.autoresizingMask = [.width, .height]
+        fx.addSubview(h)
+        p.contentView = fx
+
+        panel = p
+        host = h
+        applyLayer()
+        p.alphaValue = defaults.object(forKey: "hud.alpha") == nil ? 1 : CGFloat(defaults.double(forKey: "hud.alpha"))
+        p.ignoresMouseEvents = defaults.bool(forKey: "hud.clickThrough")
+        relayout()
+        if !defaults.bool(forKey: "hud.hidden") { p.orderFrontRegardless() }
+    }
+
+    static func roundedMask(_ r: CGFloat) -> NSImage {
+        let edge = r * 2 + 1
+        let img = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r).fill()
+            return true
+        }
+        img.capInsets = NSEdgeInsets(top: r, left: r, bottom: r, right: r)
+        img.resizingMode = .stretch
+        return img
+    }
+
+    func initialFrame(height: CGFloat) -> NSRect {
+        if defaults.object(forKey: "hud.x") != nil {
+            let x = defaults.double(forKey: "hud.x"), top = defaults.double(forKey: "hud.top")
+            return clamped(NSRect(x: x, y: top - height, width: hudWidth, height: height))
+        }
+        let vf = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        return NSRect(x: vf.maxX - hudWidth - 18, y: vf.maxY - 18 - height, width: hudWidth, height: height)
+    }
+
+    /// Keep the whole panel on the screen it mostly sits on (top edge wins if it is taller than the screen).
+    func clamped(_ f: NSRect) -> NSRect {
+        func overlap(_ s: NSScreen) -> CGFloat { let i = s.frame.intersection(f); return i.isNull ? 0 : i.width * i.height }
+        let screen = NSScreen.screens.max { overlap($0) < overlap($1) }.flatMap { overlap($0) > 0 ? $0 : nil } ?? NSScreen.main
+        guard let v = screen?.visibleFrame else { return f }
+        var r = f
+        r.origin.x = min(max(r.minX, v.minX), v.maxX - r.width)
+        r.origin.y = r.height >= v.height ? v.maxY - r.height : min(max(r.minY, v.minY), v.maxY - r.height)
+        return r
+    }
+
+    func savePosition() {
+        defaults.set(Double(panel.frame.minX), forKey: "hud.x")
+        defaults.set(Double(panel.frame.maxY), forKey: "hud.top")
+    }
+
+    /// Several @Published fields change per refresh; measure the layout once per main-loop turn.
+    func scheduleRelayout() {
+        guard !layoutQueued else { return }
+        layoutQueued = true
+        DispatchQueue.main.async { [weak self] in
+            self?.layoutQueued = false
+            self?.relayout()
+        }
+    }
+
+    func relayout() {
+        guard let panel, let host else { return }
+        let size = host.intrinsicContentSize
+        if size.width > 10, size.height > 10,
+           abs(panel.frame.height - size.height) > 0.5 || abs(panel.frame.width - size.width) > 0.5 {
+            var f = panel.frame
+            let top = f.maxY
+            f.size = size
+            f.origin.y = top - size.height
+            panel.setFrame(clamped(f), display: true)
+            panel.invalidateShadow()
+        }
+        updateStatusTitle()
+    }
+
+    func applyLayer() {
+        switch layer {
+        case .float:
+            panel.level = .floating
+            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        case .desktop:
+            panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        }
+    }
+
+    func toggleLayer() {
+        layer = layer == .float ? .desktop : .float
+        defaults.set(layer.rawValue, forKey: "hud.layer")
+        applyLayer()
+        if panel.isVisible { panel.orderFrontRegardless() }   // a hidden HUD stays hidden
+    }
+
+    // MARK: status item
+
+    func buildStatusItem() {
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let m = NSMenu()
+        m.delegate = self
+        item.menu = m
+        updateStatusTitle()
+    }
+
+    private var lastTitle = ""
+    func updateStatusTitle() {
+        guard let item else { return }
+        var t: String
+        switch store.link {
+        case .live, .boot:
+            if let s = store.snap {
+                t = "▣ \(s.gpuRun)"
+                if s.pendingTasks > 0 { t += " ◇\(s.pendingTasks)" }
+            } else { t = "▣ …" }
+        case .auth: t = "▣ ⚠︎"
+        default: t = "▣ ✕"
+        }
+        guard t != lastTitle else { return }
+        lastTitle = t
+        item.button?.attributedTitle = NSAttributedString(string: t, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium)])
+    }
+
+    func menuNeedsUpdate(_ m: NSMenu) {
+        m.removeAllItems()
+        let head = NSMenuItem(title: "\(store.cfg.displayLabel) · \(store.cfg.host)  —  \(store.statusText)", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        m.addItem(head)
+        m.addItem(.separator())
+        add(m, "Refresh Now", #selector(refreshNow), "r")
+        add(m, panel.isVisible ? "Hide HUD" : "Show HUD", #selector(toggleHUD), "h")
+        add(m, "Compact Mode", #selector(toggleCompact), on: store.compact)
+        m.addItem(.separator())
+        add(m, "Float Above Windows", #selector(setFloat), on: layer == .float)
+        add(m, "Pin to Desktop (behind windows)", #selector(setDesktop), on: layer == .desktop)
+        let op = NSMenuItem(title: "Opacity", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for v in [100, 90, 80, 70, 60, 50] {
+            let it = NSMenuItem(title: "\(v)%", action: #selector(setOpacity(_:)), keyEquivalent: "")
+            it.target = self
+            it.tag = v
+            it.state = abs(panel.alphaValue * 100 - CGFloat(v)) < 1 ? .on : .off
+            sub.addItem(it)
+        }
+        op.submenu = sub
+        m.addItem(op)
+        add(m, "Click-Through (lock in place)", #selector(toggleClickThrough), on: panel.ignoresMouseEvents)
+        m.addItem(.separator())
+        add(m, "Reconnect SSH (MFA)…", #selector(reconnect))
+        add(m, "Edit Config…", #selector(editConfig))
+        add(m, "Reload Config", #selector(reloadConfig))
+        let login = SMAppService.mainApp.status
+        let li = add(m, login == .requiresApproval ? "Launch at Login (approve in System Settings…)" : "Launch at Login",
+                     #selector(toggleLogin), on: login == .enabled)
+        if login == .requiresApproval { li.state = .mixed }
+        m.addItem(.separator())
+        m.addItem(NSMenuItem(title: "Quit SlurmHUD", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    @discardableResult
+    func add(_ m: NSMenu, _ title: String, _ sel: Selector, _ key: String = "", on: Bool = false) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+        it.target = self
+        it.state = on ? .on : .off
+        m.addItem(it)
+        return it
+    }
+
+    @objc func refreshNow() { store.refresh() }
+    @objc func toggleCompact() { store.toggleCompact() }
+    @objc func setFloat() { if layer != .float { toggleLayer() } }
+    @objc func setDesktop() { if layer != .desktop { toggleLayer() } }
+    @objc func reconnect() { store.reconnect() }
+    @objc func reloadConfig() { store.reloadConfig() }
+    @objc func editConfig() {
+        if !FileManager.default.fileExists(atPath: Config.file.path) { Config().save() }
+        NSWorkspace.shared.open(Config.file)
+    }
+    @objc func toggleHUD() {
+        if panel.isVisible { panel.orderOut(nil) } else { panel.orderFrontRegardless() }
+        defaults.set(!panel.isVisible, forKey: "hud.hidden")
+    }
+    @objc func setOpacity(_ sender: NSMenuItem) {
+        panel.alphaValue = CGFloat(sender.tag) / 100
+        defaults.set(Double(sender.tag) / 100, forKey: "hud.alpha")
+    }
+    @objc func toggleClickThrough() {
+        panel.ignoresMouseEvents.toggle()
+        defaults.set(panel.ignoresMouseEvents, forKey: "hud.clickThrough")
+    }
+    @objc func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do {
+            switch svc.status {
+            case .enabled:
+                try svc.unregister()
+            case .requiresApproval:
+                SMAppService.openSystemSettingsLoginItems()
+            default:
+                try svc.register()
+                if svc.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+            }
+        } catch {
+            let a = NSAlert()
+            a.messageText = "Launch at Login failed"
+            a.informativeText = error.localizedDescription
+            a.runModal()
+        }
+    }
+}
+
+// MARK: - Entry
+
+@main
+@MainActor
+enum Main {
+    static func main() {
+        let args = CommandLine.arguments
+        // `SlurmHUD --parse <file>`: run the parser on a captured probe output and print a summary (tests).
+        if let i = args.firstIndex(of: "--parse"), i + 1 < args.count {
+            let text = (try? String(contentsOfFile: args[i + 1], encoding: .utf8)) ?? ""
+            print(Parser.describe(Parser.parse(text)))
+            exit(0)
+        }
+        let delegate = AppDelegate()
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        app.delegate = delegate
+        withExtendedLifetime(delegate) { app.run() }
+    }
+}

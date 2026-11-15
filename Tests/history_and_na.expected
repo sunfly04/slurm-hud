@@ -1,0 +1,7 @@
+host: login1|alice
+hist ok=612 fail=7 timeout=1 cancel=12
+failure 7611000 FAILED scr1
+failure 7611001 OOM a|b
+failure 7611002 TIMEOUT scr1
+unavailable: SHARE
+totals gpuRun=0 gpuPend=0 pendingTasks=0

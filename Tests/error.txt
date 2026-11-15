@@ -1,0 +1,2 @@
+@@HOST login1|alice
+@@ERR squeue: error: Could not establish a configuration source
