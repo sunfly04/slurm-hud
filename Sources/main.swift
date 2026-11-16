@@ -1861,14 +1861,24 @@ final class ServerHUD: NSObject {
         return img
     }
 
-    /// The saved position, or else the top-right corner, with each further server one column to the left.
-    func initialFrame(height: CGFloat) -> NSRect {
+    /// The saved position while some screen still shows part of it; otherwise (no saved position, or its display
+    /// is gone) the top-right corner of the main screen, each further server one column to the left.
+    /// The saved position is kept, so the HUD goes back there when that display returns.
+    func initialFrame(height: CGFloat, width: CGFloat = hudWidth) -> NSRect {
         if let x = prefs.double("hud.x"), let top = prefs.double("hud.top") {
-            return ServerHUD.clamped(NSRect(x: x, y: top - height, width: hudWidth, height: height))
+            let f = NSRect(x: x, y: top - height, width: width, height: height)
+            if NSScreen.screens.contains(where: { $0.frame.intersects(f) }) { return ServerHUD.clamped(f) }
         }
         let vf = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = vf.maxX - (hudWidth + 18) * CGFloat(index + 1)
-        return ServerHUD.clamped(NSRect(x: x, y: vf.maxY - 18 - height, width: hudWidth, height: height))
+        let x = vf.maxX - (width + 18) * CGFloat(index + 1)
+        return ServerHUD.clamped(NSRect(x: x, y: vf.maxY - 18 - height, width: width, height: height))
+    }
+
+    /// Displays were added, removed or rearranged: put the panel back on a screen that exists.
+    func screensChanged() {
+        guard let panel else { return }
+        let f = initialFrame(height: panel.frame.height, width: panel.frame.width)
+        if f != panel.frame { panel.setFrame(f, display: true) }
     }
 
     /// Keep the whole panel on the screen it mostly sits on (top edge wins if it is taller than the screen).
@@ -2006,6 +2016,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         buildStatusItem()
         sync(Config.loadAll(), start: false)
+        // A display unplugged or rearranged: windows saved on it would otherwise stay off-screen.
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.huds.forEach { $0.screensChanged() }
+        }
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.huds.forEach { $0.store.wake() }

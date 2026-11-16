@@ -26,7 +26,8 @@ fair-share (LevelFS) and cluster GPU availability. User-facing docs: README.md (
     the top-level keys (no list = one server, the old format). Each gets its own `Store` + `ServerHUD`.
   - `HUDPanel` / `ServerHUD` / `AppDelegate`: `ServerHUD` owns one server's borderless non-activating `NSPanel`
     (desktop level by default, optionally floating). `AppDelegate.sync` matches windows to the config on launch and
-    reload, and owns the single status item and its menu. UI settings live in `UserDefaults` (domain `io.github.slurm-hud`)
+    reload, and owns the single status item and its menu. On a display change (`didChangeScreenParameters`) a panel whose
+    saved position is on no screen moves to the default corner; the saved position is kept for when that display returns. UI settings live in `UserDefaults` (domain `io.github.slurm-hud`)
     through `Prefs` as `<key>.<host>`; the first server falls back to the pre-multi-server keys (`hud.x`, `compact`, …).
 - `Info.plist`: `LSUIElement` (no Dock icon). `build.sh` compiles with `swiftc` (no Xcode project); `./build.sh universal`
   builds arm64 + x86_64 and writes `build/SlurmHUD.zip`.
