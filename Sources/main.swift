@@ -1090,6 +1090,10 @@ final class Store: ObservableObject {
         guard cfgError == nil else { return }
         let opts = SSH.base(cfg, cp).map(shq).joined(separator: " ")
         let h = shq(cfg.host)
+        // A master that died (sleep, network change) can leave its socket behind; ssh then refuses to create a new
+        // one ("already exists, disabling multiplexing") and the login opens no link. -O check just failed, so no
+        // master answers on it and removing the file is safe.
+        let clearStale = cp.map { "[ -S \(shq($0)) ] && rm -f -- \(shq($0))" } ?? ":"
         let body = """
         #!/bin/zsh
         clear
@@ -1097,6 +1101,7 @@ final class Store: ObservableObject {
         if ssh \(opts) -O check -- \(h) 2>/dev/null; then
           printf '\\033[32m✓ link already up\\033[0m\\n'
         else
+          \(clearStale)
           ssh \(opts) -fN -o ControlMaster=yes -o ControlPersist=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -- \(h) \\
             && printf '\\033[32m✓ link established. The HUD picks it up within seconds; you can close this window.\\033[0m\\n' \\
             || printf '\\033[31m✗ connection failed\\033[0m\\n'

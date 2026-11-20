@@ -69,6 +69,7 @@ RSS overstates it because it counts shared frameworks.
   stdout pipe open and hang `readDataToEndOfFile`.
 - Reconnect writes `<config dir>/connect-<host>-<hash of target>.command` and opens it in Terminal. That script runs
   `ssh -fN -o ControlMaster=yes -o ControlPersist=yes <host>`, so the user does MFA once. Every interpolated value goes through `shq()`.
+  When `-O check` fails it first removes a leftover socket file (a dead master's), or ssh would refuse to create the new one.
 - Remote env: non-login shells on some clusters lack `SLURM_CONF`/PATH. The first fetch uses `bash -l -s`. It caches
   `SLURM_CONF|bindir` in UserDefaults (`remoteEnv.<host>`); later fetches run plain `bash -s` with exports.
   On `@@ERR` the cache is cleared and the fetch retries with a login shell.
