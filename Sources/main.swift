@@ -84,6 +84,7 @@ struct Config: Codable, Equatable {
     static func loadAll() -> [(Config, String?)] {
         guard let data = try? Data(contentsOf: file) else {
             let c = Config()
+            if FileManager.default.fileExists(atPath: file.path) { return [(c, "config: can't read config.json")] }
             c.save()
             return [(c, c.problem)]
         }
@@ -161,8 +162,8 @@ struct Snapshot: Equatable {
         jobs.filter(\.isPending).sorted { ($0.start ?? .distantFuture, $0.id) < ($1.start ?? .distantFuture, $1.id) }
     }
     var gpuRun: Int { running.reduce(0) { $0 + $1.gpus } }
-    var gpuPend: Int { pending.reduce(0) { $0 + $1.gpus } }
-    var pendingTasks: Int { pending.reduce(0) { $0 + $1.tasks } }
+    var gpuPend: Int { jobs.reduce(0) { $1.isPending ? $0 + $1.gpus : $0 } }
+    var pendingTasks: Int { jobs.reduce(0) { $1.isPending ? $0 + $1.tasks : $0 } }
 
     static func group(_ js: [Job]) -> [TypeCount] {
         var d: [String: Int] = [:]
@@ -333,13 +334,13 @@ enum Remote {
     // Names go in the last column so a '|' inside a name can be re-joined by the parser.
     static let script = #"""
     H=__HOURS__; WANT_SHARE=__SHARE__; WANT_NODES=__NODES__; WANT_HIST=__HIST__
-    export SLURM_TIME_FORMAT=%s
+    export SLURM_TIME_FORMAT=%s SLURM_BITSTR_LEN=0
     sq() { sed -E 's/ +\|/|/g'; }
     command -v squeue >/dev/null 2>&1 || { echo "@@ERR slurm commands not found in PATH"; exit 0; }
     echo "@@HOST $(hostname -s)|$USER"
     echo "@@NOW $(date +%s)"
     echo "@@ENV ${SLURM_CONF:-}|$(dirname "$(command -v squeue)")"
-    J=$(squeue -u "$USER" -h -O "JobArrayID:60|,Partition:120|,StateCompact:8|,TimeUsed:20|,TimeLimit:20|,NumNodes:8|,tres-alloc:300|,ReasonList:300|,StartTime:24|,tres-per-node:120|,Name:300|" 2>&1) || { echo "@@ERR $(printf '%s' "$J" | tail -n 1)"; exit 0; }
+    J=$(squeue -u "$USER" -h -O "JobArrayID:1000|,Partition:120|,StateCompact:8|,TimeUsed:20|,TimeLimit:20|,NumNodes:8|,tres-alloc:300|,ReasonList:300|,StartTime:24|,tres-per-node:120|,Name:300|" 2>&1) || { echo "@@ERR $(printf '%s' "$J" | tail -n 1)"; exit 0; }
     echo "@@JOBS"
     [ -n "$J" ] && printf '%s\n' "$J" | sq
     if [ "$WANT_SHARE" = 1 ]; then
@@ -475,12 +476,19 @@ enum Parser {
     }
 
     /// Number of tasks in a collapsed array id like `123_[0-9%2]`, `123_[1,3,5-7]`, `123_[0-99:2]`.
+    /// An expression cut off before its `]` counts its complete parts (the last one may be partial).
     static func arrayTasks(_ id: String) -> Int {
-        guard let open = id.firstIndex(of: "["), let close = id.lastIndex(of: "]"), open < close else { return 1 }
-        var spec = id[id.index(after: open)..<close]
-        if let pct = spec.firstIndex(of: "%") { spec = spec[..<pct] }
+        guard let open = id.firstIndex(of: "[") else { return 1 }
+        let close = id.lastIndex(of: "]")
+        if let close, close < open { return 1 }
+        var spec = id[id.index(after: open)..<(close ?? id.endIndex)]
+        let pct = spec.firstIndex(of: "%")
+        if let pct { spec = spec[..<pct] }
+        var parts = spec.split(separator: ",", omittingEmptySubsequences: false)
+        // Cut off before "]": the last part may be partial unless a "," or "%" followed it.
+        if close == nil, pct == nil, parts.count > 1 { parts.removeLast() }
         var n = 0
-        for part in spec.split(separator: ",") {
+        for part in parts {
             let stepParts = part.split(separator: ":")
             let step = stepParts.count > 1 ? max(1, Int(stepParts[1]) ?? 1) : 1
             let r = stepParts.first?.split(separator: "-") ?? []
@@ -604,7 +612,8 @@ enum Parser {
             let base = String(raw.prefix { $0.isLetter })
             let usable = usableBase.contains(base) && !raw.contains(where: blockingFlags.contains)
             let used = Dictionary(gpuMatches(f[2]), uniquingKeysWith: +)
-            for (t, n) in gpuMatches(f[1]) where n > 0 {
+            let avail = Dictionary(gpuMatches(f[1]), uniquingKeysWith: +)   // per-socket entries of one type add up
+            for (t, n) in avail where n > 0 {
                 var p = pools[t] ?? Pool(id: t)
                 let u = min(used[t] ?? 0, n)
                 p.total += n
@@ -704,9 +713,11 @@ enum SSH {
 
     /// Fully expanded ControlPath for the host (our own if ~/.ssh/config gives none), or nil if ssh -G fails.
     /// Passing it expanded keeps the socket path stable even when we override ProxyCommand below.
+    /// The mode flag (`-G`, `-O check`) always comes first: an option in `extraSSHOptions` missing its value
+    /// (`"-i"`) would otherwise swallow it and turn this local query into a real login.
     static func controlPath(_ c: Config) -> String? {
         func query(_ pre: [String]) -> String? {
-            let r = run(pre + c.extraSSHOptions + ["-G", "--", c.host], stdin: nil, timeout: 5)
+            let r = run(["-G", "-o", "BatchMode=yes"] + pre + c.extraSSHOptions + ["--", c.host], stdin: nil, timeout: 5)
             guard r.status == 0 else { return nil }
             for line in r.out.split(separator: "\n") where line.hasPrefix("controlpath ") { return String(line.dropFirst(12)) }
             return "none"
@@ -724,25 +735,38 @@ enum SSH {
 
     /// masterOnly: the master socket was up a moment ago. ProxyCommand=false makes sure that if it vanished,
     /// ssh fails locally instead of silently falling back to a direct (MFA) login.
+    /// A direct fetch gets ControlPath=none (the first -o wins over base's and ~/.ssh/config's): a dead master's
+    /// leftover socket would otherwise make ssh print "Control socket connect(…): Connection refused" before it
+    /// logs in, and that line must not be mistaken for a network failure.
     static func fetchArgs(_ c: Config, _ cp: String?, masterOnly: Bool) -> [String] {
         var a = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=no",
                  "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR"]
-        if masterOnly { a += ["-o", "ProxyCommand=/usr/bin/false"] }
-        return a + base(c, cp)
+        if masterOnly { return a + ["-o", "ProxyCommand=/usr/bin/false"] + base(c, cp) }
+        a += ["-o", "ControlPath=none"]
+        return a + base(c, nil)
     }
 
     static func masterUp(_ c: Config, _ cp: String?) -> Bool {
         guard let cp else { return false }
         // No socket file means no master: skip spawning ssh. A file that exists still has to pass the real check.
         if !FileManager.default.fileExists(atPath: (cp as NSString).expandingTildeInPath) { return false }
-        return run(["-o", "LogLevel=QUIET"] + base(c, cp) + ["-O", "check", "--", c.host], stdin: nil, timeout: 5).status == 0
+        return run(["-O", "check", "-o", "LogLevel=QUIET", "-o", "BatchMode=yes"] + base(c, cp) + ["--", c.host], stdin: nil, timeout: 5).status == 0
     }
 
-    /// Failures that never reached sshd's auth stage, so retrying cannot trip a login ban.
+    /// stderr lines that say why ssh stopped; local multiplexing chatter ("Control socket connect(…)") is not one.
+    static func errorLines(_ e: String) -> [Substring] {
+        e.split(separator: "\n").filter { l in
+            let s = l.lowercased()
+            return !s.contains("control socket") && !s.hasPrefix("mux_client") && !s.contains("controlpath")
+        }
+    }
+
+    /// Failures that never reached sshd's auth stage, so retrying cannot trip a login ban. Only ssh's own final
+    /// connection error counts; anything else (an auth failure, a proxy or jump host problem) is treated as a login.
     static func isNetworkError(_ e: String) -> Bool {
-        let s = e.lowercased()
-        return ["timed out", "could not resolve", "nodename nor servname", "name or service not known",
-                "network is unreachable", "no route to host", "connection refused"].contains { s.contains($0) }
+        guard let last = errorLines(e).last?.lowercased() else { return false }
+        return ["ssh: connect to host", "could not resolve hostname", "nodename nor servname", "name or service not known",
+                "banner exchange"].contains { last.contains($0) }
     }
 }
 
@@ -852,6 +876,7 @@ final class Store: ObservableObject {
         cpResolved = false
         directFailed = false
         backoff = 30
+        fastUntil = .distantPast
         snap = nil
         spark = []
         link = .boot
@@ -892,14 +917,17 @@ final class Store: ObservableObject {
         // The old key for a plain host; options that may point ssh elsewhere get their own cache entry.
         let envKey = "remoteEnv." + (cfg.extraSSHOptions.isEmpty ? cfg.host : cfg.target)
         let cached = UserDefaults.standard.string(forKey: envKey)
-        let resolved = cpResolved, knownCP = cp, masterOnlyMode = directFailed
+        // While the user is logging in through the RECONNECT script (fastUntil), only watch for the master:
+        // a direct login now would race their MFA, and the 4 s fast polling must never mean 4 s logins.
+        let resolved = cpResolved, knownCP = cp, masterOnlyMode = directFailed || Date() < fastUntil
 
         DispatchQueue.global(qos: .utility).async {
             let cp = resolved ? knownCP : SSH.controlPath(cfg)
             let master = SSH.masterUp(cfg, cp)
             var r: SSH.Result?
             var parsed: Parser.Out?
-            let gate: DirectGate.Verdict = master || masterOnlyMode ? .failed : DirectGate.begin(cfg.target)
+            // No ControlPath means we can't tell whether a master is up: don't log in past one.
+            let gate: DirectGate.Verdict = master || masterOnlyMode || cp == nil ? .failed : DirectGate.begin(cfg.target)
             if master || gate == .go {
                 var prelude = ""
                 var remote = "bash -l -s"
@@ -923,6 +951,13 @@ final class Store: ObservableObject {
                 guard myGen == self.gen else {   // config changed (or the server was removed) while we were out
                     self.syncing = false
                     self.refresh()
+                    return
+                }
+                guard cp != nil else {   // ssh -G failed or hung: retry the local lookup with backoff
+                    self.syncing = false
+                    self.backoff = min(self.backoff * 2, 900)
+                    self.link = .down("ssh -G \(cfg.host) failed: check ~/.ssh/config")
+                    self.scheduleNext()
                     return
                 }
                 self.cp = cp
@@ -979,7 +1014,7 @@ final class Store: ObservableObject {
             snap = sn
             fastUntil = .distantPast
         } else {
-            let msg = r.err.split(separator: "\n").last.map(String.init) ?? ""
+            let msg = SSH.errorLines(r.err).last.map(String.init) ?? ""
             if r.timedOut {
                 if !viaMaster { directFailed = true }   // it connected but hung: don't knock again
                 link = .down("ssh timed out after 30s")
@@ -1051,7 +1086,7 @@ final class Store: ObservableObject {
         let fast = Date() < fastUntil
         let iv: Double
         switch link {
-        case .live, .boot: iv = cfg.refreshSeconds
+        case .live, .boot: iv = min(cfg.refreshSeconds, max(5, nextSlow.timeIntervalSinceNow))
         case .auth: iv = fast ? 3 : 15        // local socket check only, no network
         case .down: iv = fast ? 4 : backoff
         case .error: iv = fast ? 4 : 60
@@ -1088,23 +1123,47 @@ final class Store: ObservableObject {
     /// Every value is passed through shq(); nothing from the config reaches the shell unquoted.
     func reconnect() {
         guard cfgError == nil else { return }
+        if cpResolved, let cp { openConnectScript(cp); return }
+        // The first round hasn't resolved the socket path yet (or ssh -G failed): without it the script's login
+        // would open no shared link. ssh -G is local and quick.
+        let cfg = self.cfg, myGen = gen
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cp = SSH.controlPath(cfg)
+            DispatchQueue.main.async {
+                guard myGen == self.gen else { return }
+                guard let cp else { self.link = .down("ssh -G \(cfg.host) failed: check ~/.ssh/config"); return }
+                self.cp = cp
+                self.cpResolved = true
+                self.openConnectScript(cp)
+            }
+        }
+    }
+
+    private func openConnectScript(_ cp: String) {
         let opts = SSH.base(cfg, cp).map(shq).joined(separator: " ")
-        let h = shq(cfg.host)
+        let h = shq(cfg.host), sock = shq((cp as NSString).expandingTildeInPath)
         // A master that died (sleep, network change) can leave its socket behind; ssh then refuses to create a new
-        // one ("already exists, disabling multiplexing") and the login opens no link. -O check just failed, so no
-        // master answers on it and removing the file is safe.
-        let clearStale = cp.map { "[ -S \(shq($0)) ] && rm -f -- \(shq($0))" } ?? ":"
+        // one ("already exists, disabling multiplexing") and the login opens no link. The file is removed only when
+        // the check says nothing listens on it ("Connection refused"), never on another kind of failure.
         let body = """
         #!/bin/zsh
         clear
         printf '\\033[36m◢ SLURM-HUD\\033[0m  opening a persistent ssh link to %s\\n' \(h)
-        if ssh \(opts) -O check -- \(h) 2>/dev/null; then
+        if chk=$(ssh -O check \(opts) -- \(h) 2>&1); then
           printf '\\033[32m✓ link already up\\033[0m\\n'
         else
-          \(clearStale)
-          ssh \(opts) -fN -o ControlMaster=yes -o ControlPersist=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -- \(h) \\
-            && printf '\\033[32m✓ link established. The HUD picks it up within seconds; you can close this window.\\033[0m\\n' \\
-            || printf '\\033[31m✗ connection failed\\033[0m\\n'
+          case $chk in *"Connection refused"*) [ -S \(sock) ] && rm -f -- \(sock) ;; esac
+          if ssh -fN -o ControlMaster=yes -o ControlPersist=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \(opts) -- \(h); then
+            ok=0
+            for i in 1 2 3; do ssh -O check \(opts) -- \(h) 2>/dev/null && { ok=1; break; }; sleep 1; done
+            if [ $ok = 1 ]; then
+              printf '\\033[32m✓ link established. The HUD picks it up within seconds; you can close this window.\\033[0m\\n'
+            else
+              printf '\\033[31m✗ logged in, but no shared link was created at %s\\033[0m\\n' \(sock)
+            fi
+          else
+            printf '\\033[31m✗ connection failed\\033[0m\\n'
+          fi
         fi
 
         """
@@ -1112,9 +1171,14 @@ final class Store: ObservableObject {
         let safe = String(cfg.host.map { $0.isLetter || $0.isNumber || "._-".contains($0) ? $0 : "_" })
         let hash = cfg.target.utf8.reduce(UInt32(2166136261)) { ($0 ^ UInt32($1)) &* 16777619 }   // FNV-1a: stable across launches
         let url = Config.dir.appendingPathComponent("connect-\(safe)-\(String(hash, radix: 16)).command")
-        try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
-        try? body.write(to: url, atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        do {
+            try FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+            try body.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        } catch {
+            link = .down("can't write \(url.lastPathComponent): \(error.localizedDescription)")
+            return
+        }
         NSWorkspace.shared.open(url)
         fastUntil = Date().addingTimeInterval(180)
         if !syncing { scheduleNext() }
@@ -1508,7 +1572,7 @@ struct JobMenu: View {
             Button("Copy \(g.jobs.count) Job IDs") { copy(ids) }
             Button("Copy Job Names") { copy(g.jobs.map(\.name).joined(separator: "\n")) }
         }
-        Button("Copy  scancel \(g.jobs.count == 1 ? ids : "… (\(g.jobs.count) jobs)")") { copy("scancel \(ids)") }
+        Button("Copy  scancel \(g.jobs.count == 1 ? ids : "… (\(g.jobs.count) jobs)")") { copy("scancel " + g.jobs.map { shq($0.id) }.joined(separator: " ")) }
     }
     func copy(_ s: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string) }
 }
@@ -1731,6 +1795,7 @@ struct CompactView: View {
             stat("\(snap.pendingTasks)", "QUEUED", T.amber)
             bar
             VStack(alignment: .leading, spacing: 1) {
+                if let w = snap.warn("SHARE") { Text(w).font(T.mono(7.5, .bold)).tracking(1.2).foregroundColor(T.amber) }
                 (Text("LFS·G ").foregroundColor(T.dim) + Text(Fmt.num(acct)).foregroundColor(T.lfs(acct))).font(T.mono(9.5, .medium))
                 (Text("LFS·U ").foregroundColor(T.dim) + Text(Fmt.num(row?.levelFS)).foregroundColor(T.lfs(row?.levelFS))).font(T.mono(9.5, .medium))
             }
@@ -2199,6 +2264,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 enum Main {
     static func main() {
         let args = CommandLine.arguments
+        // A debug flag missing its file would otherwise fall through to the live app and talk to the cluster.
+        for f in ["--parse", "--demo", "--render"] {
+            if let i = args.firstIndex(of: f), i + 1 >= args.count || args[i + 1].hasPrefix("--") {
+                FileHandle.standardError.write(Data("usage: SlurmHUD \(f) <file>\n".utf8))
+                exit(2)
+            }
+        }
         // `SlurmHUD --parse <file>`: run the parser on a captured probe output and print a summary (tests).
         if let i = args.firstIndex(of: "--parse"), i + 1 < args.count {
             let text = (try? String(contentsOfFile: args[i + 1], encoding: .utf8)) ?? ""

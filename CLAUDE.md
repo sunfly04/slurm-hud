@@ -60,7 +60,14 @@ RSS overstates it because it counts shared frameworks.
   - When the master is up, the fetch also gets `ProxyCommand=/usr/bin/false`. If the socket vanishes in between,
     ssh then fails locally instead of falling back to a direct login.
   - With no master, the app tries one direct login. Any failure that reached the server sets `directFailed`;
-    after that it only polls the local socket. Pure network errors (refused, unreachable, DNS) back off exponentially, up to 15 min.
+    after that it only polls the local socket. Pure network errors back off exponentially, up to 15 min.
+    `isNetworkError` judges only ssh's final error line (`ssh: connect to host …`, DNS, banner timeout); anything else
+    counts as a login. A direct fetch uses `ControlPath=none`: a dead master's socket makes ssh print
+    "Control socket connect(…): Connection refused" and then log in anyway, which once looked like a network error.
+  - After RECONNECT (`fastUntil`, 180 s of fast polling) the store only watches for the master: no direct login races
+    the user's MFA. With no resolved ControlPath (`ssh -G` failed) it never logs in either; it retries `ssh -G` with backoff.
+  - `ssh -G` and `ssh -O check` put the mode flag first, so an `extraSSHOptions` entry missing its value can't
+    swallow it and turn a local query into a login.
   - With several servers, `DirectGate` rations direct logins per ssh target (`Config.target` = host + `extraSSHOptions`)
     across all windows: one attempt at a time, none after one failed, until Reload Config. Keep every direct attempt behind it.
 - The ControlPath is resolved once with `ssh -G` and passed **expanded** to every call (fetch, check, reconnect).
@@ -69,7 +76,8 @@ RSS overstates it because it counts shared frameworks.
   stdout pipe open and hang `readDataToEndOfFile`.
 - Reconnect writes `<config dir>/connect-<host>-<hash of target>.command` and opens it in Terminal. That script runs
   `ssh -fN -o ControlMaster=yes -o ControlPersist=yes <host>`, so the user does MFA once. Every interpolated value goes through `shq()`.
-  When `-O check` fails it first removes a leftover socket file (a dead master's), or ssh would refuse to create the new one.
+  When `-O check` reports "Connection refused" (a dead master's leftover socket) it removes the file first, or ssh would
+  refuse to create the new one; it then verifies the new master. The ControlPath is resolved before the script is written.
 - Remote env: non-login shells on some clusters lack `SLURM_CONF`/PATH. The first fetch uses `bash -l -s`. It caches
   `SLURM_CONF|bindir` in UserDefaults (`remoteEnv.<host>`); later fetches run plain `bash -s` with exports.
   On `@@ERR` the cache is cleared and the fetch retries with a login shell.
